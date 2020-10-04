@@ -39,6 +39,10 @@ struct CAT : public FunctionPass {
     std::unordered_map<Function *, std::string> fptr2name;
     std::unordered_map<Function *, int> fptr2cnt;
 
+    llvm::BitVector GEN;
+    std::vector<llvm::Instruction *> instr_vec;
+    std::vector<llvm::BitVector> KILL;
+
     CAT() : FunctionPass(ID) {}
 
     // This function is invoked once at the initialization phase of the compiler
@@ -58,62 +62,15 @@ struct CAT : public FunctionPass {
     bool runOnFunction (Function &F) override {
       // errs() << "Hello LLVM World at \"runOnFunction\"\n" ;
         std::string caller_name = F.getName().str();
-        unsigned NumInstrs = F.getInstructionCount();
-
-        llvm::BitVector GEN(NumInstrs, 0);
-        std::vector<llvm::BitVector> KILL (NumInstrs, llvm::BitVector(NumInstrs, 0));
-        std::unordered_map<void *, llvm::BitVector> instr2bitmap;
-        
-        std::vector<llvm::Instruction *> instr_vec (NumInstrs, NULL);
 
         H0_init();
         H0_function_count(F);
-        H0_output(caller_name);
+        // H0_output(caller_name);
         
-        unsigned i = 0;
-        for (auto& inst: llvm::instructions(F)) {
-            instr_vec[i] = &inst;
-           if (isa<CallInst>(&inst)){
-                CallInst * call_instr = cast<CallInst>(&inst);
-                Function * callee_ptr = call_instr->getCalledFunction();
-
-                if (fptr2name.find(callee_ptr) != fptr2name.end()) {
-                    // find one call_instr that calls one of CAT functions  
-                    std::string callee_name = fptr2name[callee_ptr];
-                    if (callee_name != "CAT_get") {
-                        
-                        GEN.set(i);
-                        
-                        if (callee_name == "CAT_new") {
-                            instr2bitmap[call_instr] = llvm::BitVector(NumInstrs, 0);
-                            instr2bitmap[call_instr].set(i);
-                        } else {
-                            // get first operand if CAT_set, CAT_add, CAT_sub
-                            void * arg0 = call_instr->getArgOperand(0);
-                            instr2bitmap[arg0].set(i);
-                        }
-                    }
-                }
-            }
-            i++;
-        }
-
-        for (i = 0; i < NumInstrs; i++) {
-            if (GEN.test(i)) {
-                // This is a GEN, either, CAT_new, CAT_set, CAT_add, CAT_sub
-                CallInst * call_instr = cast<CallInst>(instr_vec[i]);
-                void * arg0 = call_instr->getArgOperand(0);
-                if (instr2bitmap.find(arg0) != instr2bitmap.end()) {
-                    // This must be a CAT_set, CAT_add, CAT_sub
-                    KILL[i] = instr2bitmap[arg0];
-                } else {
-                    // must be a CAT_new
-                    KILL[i] = instr2bitmap[call_instr];
-                }
-
-                KILL[i].flip(i);
-            }
-        }
+        H1_init(F);
+        H1_GEN_KILL(F);
+        H1_output(caller_name);
+        
 
         // H1_output(
         //     caller_name,  /* function name*/
@@ -163,13 +120,65 @@ struct CAT : public FunctionPass {
         }
     }
 
+    void H1_init(Function &F) {
+        unsigned NumInstrs = F.getInstructionCount();
 
-    void H1_output(
-        std::string & func_name, 
-        llvm::BitVector & GEN,
-        std::vector<llvm::BitVector> & KILL,
-        std::vector<llvm::Instruction *> & instr_vec
-    ) {
+        GEN = llvm::BitVector(NumInstrs, 0);
+        KILL = std::vector<llvm::BitVector>(NumInstrs, llvm::BitVector(NumInstrs, 0));
+        instr_vec = std::vector<llvm::Instruction *>(NumInstrs, NULL);
+    }
+
+    void H1_GEN_KILL(Function &F) {
+        unsigned NumInstrs = F.getInstructionCount();
+        std::unordered_map<void *, llvm::BitVector> instr2bitmap;
+        unsigned i = 0;
+        for (auto& inst: llvm::instructions(F)) {
+            instr_vec[i] = &inst;
+           if (isa<CallInst>(&inst)){
+                CallInst * call_instr = cast<CallInst>(&inst);
+                Function * callee_ptr = call_instr->getCalledFunction();
+
+                if (fptr2name.find(callee_ptr) != fptr2name.end()) {
+                    // find one call_instr that calls one of CAT functions  
+                    std::string callee_name = fptr2name[callee_ptr];
+                    if (callee_name != "CAT_get") {
+                        
+                        GEN.set(i);
+                        
+                        if (callee_name == "CAT_new") {
+                            instr2bitmap[call_instr] = llvm::BitVector(NumInstrs, 0);
+                            instr2bitmap[call_instr].set(i);
+                        } else {
+                            // get first operand if CAT_set, CAT_add, CAT_sub
+                            void * arg0 = call_instr->getArgOperand(0);
+                            instr2bitmap[arg0].set(i);
+                        }
+                    }
+                }
+            }
+            i++;
+        }
+
+        for (i = 0; i < instr_vec.size(); i++) {
+            if (GEN.test(i)) {
+                // This is a GEN, either, CAT_new, CAT_set, CAT_add, CAT_sub
+                CallInst * call_instr = cast<CallInst>(instr_vec[i]);
+                void * arg0 = call_instr->getArgOperand(0);
+                if (instr2bitmap.find(arg0) != instr2bitmap.end()) {
+                    // This must be a CAT_set, CAT_add, CAT_sub
+                    KILL[i] = instr2bitmap[arg0];
+                } else {
+                    // must be a CAT_new
+                    KILL[i] = instr2bitmap[call_instr];
+                }
+
+                // it should not kill itself
+                KILL[i].flip(i);
+            }
+        }
+    }
+
+    void H1_output(std::string & func_name ) {
         errs() << "Function \"" << func_name << "\" " << '\n';
         for (int i = 0; i < instr_vec.size(); i++){
             errs() << "INSTRUCTION: " << *instr_vec[i] << '\n';
