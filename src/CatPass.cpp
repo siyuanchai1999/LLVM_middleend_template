@@ -23,14 +23,11 @@
 #include <unordered_map>
 using namespace llvm;
  
-
+ 
 namespace {
 struct CAT : public FunctionPass {
     static char ID; 
     // map(caller_name, (callee_name, count))
-    // std::map<std::string, std::map<std::string, int>> func_count;
-    std::map<std::string, int> func_count;
-
     std::set<std::string> func_set = {
         "CAT_new",
         "CAT_add",
@@ -40,7 +37,8 @@ struct CAT : public FunctionPass {
     };
     
     std::unordered_map<Function *, std::string> fptr2name;
-    
+    std::unordered_map<Function *, int> fptr2cnt;
+
     CAT() : FunctionPass(ID) {}
 
     // This function is invoked once at the initialization phase of the compiler
@@ -52,6 +50,7 @@ struct CAT : public FunctionPass {
             fptr2name[fptr] = str;
         }
         return false;
+        
     }
 
     // This function is invoked once per function compiled
@@ -59,46 +58,6 @@ struct CAT : public FunctionPass {
     bool runOnFunction (Function &F) override {
       // errs() << "Hello LLVM World at \"runOnFunction\"\n" ;
         std::string caller_name = F.getName().str();
-        for (auto& inst: llvm::instructions(F)) {
-        
-            if (isa<CallInst>(&inst)){
-                // errs() << inst;
-                CallInst *callInst = cast<CallInst>(&inst);
-                std::string callee_name = callInst->getCalledFunction()->getName().str();
-                // errs() << callee_name << " called in " << caller_name << '\n';
-                
-                // if (func_set.find(callee_name) != func_set.end()) {
-                //     // found callee function
-                //     // std::map<std::string, int> * CAT_map_ptr;
-                //     if (func_count.find(caller_name) == func_count.end()) {
-                //         func_count[caller_name] = std::map<std::string, int>();
-                //     } 
-
-                //     if (func_count[caller_name].find(callee_name) == func_count[caller_name].end()){
-                //         func_count[caller_name][callee_name] = 0;
-                //     }
-
-                //     func_count[caller_name][callee_name] += 1;
-                // }
-                if (func_set.find(callee_name) != func_set.end()) {
-                    // found callee function
-                    // std::map<std::string, int> * CAT_map_ptr;
-
-                    if (func_count.find(callee_name) == func_count.end()) {
-                        func_count[callee_name] = 0;
-                    }
-
-                    func_count[callee_name] = func_count[callee_name] + 1;
-                }
-            }
-        }
-
-        // for (const auto& kv : func_count) {
-        //     errs() << "H0: \"" << caller_name << "\": " << kv.first << ": " << kv.second << "\n";
-        // }
-
-        func_count.clear();
-
         unsigned NumInstrs = F.getInstructionCount();
 
         llvm::BitVector GEN(NumInstrs, 0);
@@ -107,10 +66,14 @@ struct CAT : public FunctionPass {
         
         std::vector<llvm::Instruction *> instr_vec (NumInstrs, NULL);
 
+        H0_init();
+        H0_function_count(F);
+        H0_output(caller_name);
+        
         unsigned i = 0;
         for (auto& inst: llvm::instructions(F)) {
             instr_vec[i] = &inst;
-            if (isa<CallInst>(&inst)){
+           if (isa<CallInst>(&inst)){
                 CallInst * call_instr = cast<CallInst>(&inst);
                 Function * callee_ptr = call_instr->getCalledFunction();
 
@@ -152,12 +115,12 @@ struct CAT : public FunctionPass {
             }
         }
 
-        H1_output(
-            caller_name,  /* function name*/
-            GEN,
-            KILL,
-            instr_vec
-        );
+        // H1_output(
+        //     caller_name,  /* function name*/
+        //     GEN,
+        //     KILL,
+        //     instr_vec
+        // );
 
         return false;
     }
@@ -167,6 +130,37 @@ struct CAT : public FunctionPass {
     void getAnalysisUsage(AnalysisUsage &AU) const override {
         // errs() << "Hello LLVM World at \"getAnalysisUsage\"\n" ;
         AU.setPreservesAll();
+    }
+
+    void H0_init(){
+        fptr2cnt = std::unordered_map<Function *, int>();
+    }
+    /**
+     * populate fptr2cnt map
+     * */
+    void H0_function_count(Function &F) {
+
+        for (auto& inst: llvm::instructions(F)) {
+        
+            if (isa<CallInst>(&inst)){
+                // errs() << inst;
+                CallInst *callInst = cast<CallInst>(&inst);
+                Function * callee_ptr = callInst->getCalledFunction();
+            
+                if (fptr2name.find(callee_ptr) != fptr2name.end()) {
+                    if (fptr2cnt.find(callee_ptr) == fptr2cnt.end()) {
+                        fptr2cnt[callee_ptr] = 0;
+                    }
+                    fptr2cnt[callee_ptr] = fptr2cnt[callee_ptr] + 1;
+                }
+            }
+        }
+    }
+
+    void H0_output(std::string & func_name) {
+        for (const auto& kv : fptr2cnt) {
+            errs() << "H0: \"" << func_name << "\": " << fptr2name[kv.first]  << ": " << kv.second << "\n";
+        }
     }
 
 
@@ -199,7 +193,6 @@ struct CAT : public FunctionPass {
             errs() << "**************************************\n";
             errs() << "\n\n\n";
         }
-        
     }
 };
 }
