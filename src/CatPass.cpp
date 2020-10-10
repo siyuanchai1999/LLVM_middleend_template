@@ -39,9 +39,15 @@ struct CAT : public FunctionPass {
     std::unordered_map<Function *, std::string> fptr2name;
     std::unordered_map<Function *, int> fptr2cnt;
 
+    //HW1
     llvm::BitVector GEN;
     std::vector<llvm::Instruction *> instr_vec;
     std::vector<llvm::BitVector> KILL;
+
+
+    //HW2
+    std::unordered_map<llvm::Instruction *, llvm::BitVector> IN, OUT;
+    std::unordered_map<llvm::BasicBlock *,llvm::BitVector> BB_GEN,BB_KILL,BB_IN,BB_OUT;
 
     CAT() : FunctionPass(ID) {}
 
@@ -69,7 +75,12 @@ struct CAT : public FunctionPass {
         
         H1_init(F);
         H1_GEN_KILL(F);
-        H1_output(caller_name);
+        //H1_output(caller_name);
+
+   //     H2_init(F);
+  //      H2_IN_OUT(F);
+   //     H2_output(caller_name,F);
+        //233
         
 
         // H1_output(
@@ -133,7 +144,9 @@ struct CAT : public FunctionPass {
         std::unordered_map<void *, llvm::BitVector> instr2bitmap;
         unsigned i = 0;
         for (auto& inst: llvm::instructions(F)) {
+
             instr_vec[i] = &inst;
+            errs()<<"INSTR: "<<inst<<","<<&inst<<"\n";
            if (isa<CallInst>(&inst)){
                 CallInst * call_instr = cast<CallInst>(&inst);
                 Function * callee_ptr = call_instr->getCalledFunction();
@@ -144,6 +157,9 @@ struct CAT : public FunctionPass {
                     if (callee_name != "CAT_get") {
                         
                         GEN.set(i);
+
+
+
                         
                         if (callee_name == "CAT_new") {
                             instr2bitmap[call_instr] = llvm::BitVector(NumInstrs, 0);
@@ -151,6 +167,7 @@ struct CAT : public FunctionPass {
                         } else {
                             // get first operand if CAT_set, CAT_add, CAT_sub
                             void * arg0 = call_instr->getArgOperand(0);
+                            errs()<< arg0 << "\n";
                             instr2bitmap[arg0].set(i);
                         }
                     }
@@ -158,6 +175,8 @@ struct CAT : public FunctionPass {
             }
             i++;
         }
+        errs()<<"END\n";
+
 
         for (i = 0; i < instr_vec.size(); i++) {
             if (GEN.test(i)) {
@@ -201,6 +220,105 @@ struct CAT : public FunctionPass {
             errs() << "}\n";
             errs() << "**************************************\n";
             errs() << "\n\n\n";
+        }
+    }
+
+    void H2_init(Function &F){
+        BB_IN = std::unordered_map<llvm::BasicBlock *, llvm::BitVector>();
+        BB_OUT = std::unordered_map<llvm::BasicBlock *, llvm::BitVector>();
+        BB_GEN = std::unordered_map<llvm::BasicBlock *, llvm::BitVector>();
+        BB_KILL = std::unordered_map<llvm::BasicBlock *, llvm::BitVector>();
+    }
+
+    void H2_IN_OUT(Function &F){
+        unsigned NumInstr = F.getInstructionCount();
+        unsigned inst_counter = 0;
+        //Generating GEN/KILL FOR BB
+        for (llvm::BasicBlock &bb : F){
+            //probably number of instr in a b
+
+            BB_GEN[&bb] = llvm::BitVector(NumInstr,0);
+            BB_KILL[&bb] = llvm::BitVector(NumInstr, 0);
+            BB_IN[&bb] = BitVector(NumInstr, 0);
+            BB_OUT[&bb] = BitVector(NumInstr, 0);
+
+            // Mapping <BasicBlock *, BitVector>
+            for(llvm::Instruction &inst :bb){
+                //only extract bits that belongs to this BB
+                if(GEN.test(inst_counter)){
+                    BB_GEN[&bb].set(inst_counter);
+                }
+                //TODO: Verify if this operation is correct.
+                BB_KILL[&bb] |= KILL[inst_counter];
+                inst_counter++;
+            }
+
+        }
+        // IN/OUT
+        bool changed;
+        do{
+            changed = false;
+            for(BasicBlock &bb : F){
+                for(BasicBlock *Pred : predecessors(&bb)){
+                    //TODO: UNION?????
+                    BB_IN[&bb] |= BB_OUT[Pred];
+                }
+                //TODO:Verify Old OUT is changed
+                BitVector OUT_TEMP = BB_IN[&bb];
+                BitVector INTERSECTION = BB_KILL[&bb];
+                INTERSECTION &= BB_IN[&bb];
+                OUT_TEMP ^= INTERSECTION;
+                OUT_TEMP |= BB_GEN[&bb];
+                changed = (OUT_TEMP!=BB_OUT[&bb]);
+                BB_OUT[&bb] = OUT_TEMP;
+            }
+        }while(changed);
+
+    }
+
+    void H2_output(std::string &func_name, Function &F){
+        errs() << "Function \"" << func_name << "\" " << '\n';
+        unsigned inst_counter = 0;
+        for (BasicBlock &bb : F){
+            BitVector INSTR_IN = BB_IN[&bb];
+            BitVector INSTR_OUT = BB_IN[&bb];
+            for(Instruction &inst : bb){
+                errs() << "INSTRUCTION: " << inst << '\n';
+                errs() << "***************** IN\n{\n";
+                INSTR_IN = INSTR_OUT;
+                print_bitvector(INSTR_IN);
+                errs() << "}\n";
+                errs() << "**************************************\n";
+                errs() << "***************** OUT\n{\n";
+
+                BitVector OUT_TEMP = INSTR_IN;
+                BitVector INTERSECTION = KILL[inst_counter];
+                INTERSECTION &= INSTR_IN;
+                OUT_TEMP ^= INTERSECTION;
+                if(GEN.test(inst_counter)){
+                    OUT_TEMP.set(inst_counter);
+                }
+
+                INSTR_OUT = OUT_TEMP;
+
+
+                print_bitvector(INSTR_OUT);
+                errs() << "}\n";
+                errs() << "**************************************\n";
+                errs() << "\n\n\n";
+                inst_counter++;
+            }
+        }
+
+    }
+
+    void print_bitvector(BitVector &bv){
+        if(bv.any()){
+            for (int j = 0; j < instr_vec.size(); j++ ) {
+                if (bv.test(j)) {
+                    errs() << " " << *instr_vec[j] << '\n';
+                }
+            }
         }
     }
 };
