@@ -75,11 +75,11 @@ struct CAT : public FunctionPass {
         
         H1_init(F);
         H1_GEN_KILL(F);
-        //H1_output(caller_name);
+        // H1_output(caller_name);
 
-   //     H2_init(F);
-  //      H2_IN_OUT(F);
-   //     H2_output(caller_name,F);
+       H2_init(F);
+       H2_IN_OUT(F);
+       H2_output(caller_name,F);
         //233
         
 
@@ -143,10 +143,10 @@ struct CAT : public FunctionPass {
         unsigned NumInstrs = F.getInstructionCount();
         std::unordered_map<void *, llvm::BitVector> instr2bitmap;
         unsigned i = 0;
+        
         for (auto& inst: llvm::instructions(F)) {
-
             instr_vec[i] = &inst;
-            errs()<<"INSTR: "<<inst<<","<<&inst<<"\n";
+            // errs()<<"INSTR: "<<inst<<" at "<<&inst<<"\n";
            if (isa<CallInst>(&inst)){
                 CallInst * call_instr = cast<CallInst>(&inst);
                 Function * callee_ptr = call_instr->getCalledFunction();
@@ -157,25 +157,36 @@ struct CAT : public FunctionPass {
                     if (callee_name != "CAT_get") {
                         
                         GEN.set(i);
-
-
-
-                        
+                    
+                        // if (callee_name == "CAT_new") {
+                        //     instr2bitmap[call_instr] = llvm::BitVector(NumInstrs, 0);
+                        //     instr2bitmap[call_instr].set(i);
+                        // } else {
+                        //     // get first operand if CAT_set, CAT_add, CAT_sub
+                        //     void * arg0 = call_instr->getArgOperand(0);
+                        //     errs()<< arg0 << "\n";
+                        //     instr2bitmap[arg0].set(i);
+                        // }
+                        void * key;
                         if (callee_name == "CAT_new") {
-                            instr2bitmap[call_instr] = llvm::BitVector(NumInstrs, 0);
-                            instr2bitmap[call_instr].set(i);
+                            key = call_instr;
                         } else {
                             // get first operand if CAT_set, CAT_add, CAT_sub
                             void * arg0 = call_instr->getArgOperand(0);
-                            errs()<< arg0 << "\n";
-                            instr2bitmap[arg0].set(i);
+                            key = arg0;
                         }
-                    }
+                        
+                        if (instr2bitmap.find(key) == instr2bitmap.end()) {
+                            instr2bitmap[key] = llvm::BitVector(NumInstrs, 0);
+                        }
+
+                        instr2bitmap[key].set(i);
+
+                    }   
                 }
             }
             i++;
         }
-        errs()<<"END\n";
 
 
         for (i = 0; i < instr_vec.size(); i++) {
@@ -230,6 +241,14 @@ struct CAT : public FunctionPass {
         BB_KILL = std::unordered_map<llvm::BasicBlock *, llvm::BitVector>();
     }
 
+    llvm::BitVector bitwise_diff(llvm::BitVector & A, llvm::BitVector & B) {
+        llvm::BitVector res = A;
+        llvm::BitVector neg_B = B;
+        neg_B.flip();
+        res &= neg_B;
+        return res;
+    }
+
     void H2_IN_OUT(Function &F){
         unsigned NumInstr = F.getInstructionCount();
         unsigned inst_counter = 0;
@@ -250,9 +269,12 @@ struct CAT : public FunctionPass {
                 }
                 //TODO: Verify if this operation is correct.
                 BB_KILL[&bb] |= KILL[inst_counter];
+
+                BB_GEN[&bb] = bitwise_diff(BB_GEN[&bb], KILL[inst_counter]);
+                if (GEN[inst_counter]) BB_KILL[&bb][inst_counter] = 0;
                 inst_counter++;
             }
-
+             
         }
         // IN/OUT
         bool changed;
@@ -269,7 +291,8 @@ struct CAT : public FunctionPass {
                 INTERSECTION &= BB_IN[&bb];
                 OUT_TEMP ^= INTERSECTION;
                 OUT_TEMP |= BB_GEN[&bb];
-                changed = (OUT_TEMP!=BB_OUT[&bb]);
+                
+                if (!changed) changed = (OUT_TEMP!=BB_OUT[&bb]);
                 BB_OUT[&bb] = OUT_TEMP;
             }
         }while(changed);
