@@ -141,52 +141,54 @@ struct CAT : public FunctionPass {
 
     void H1_GEN_KILL(Function &F) {
         unsigned NumInstrs = F.getInstructionCount();
+        // every instruction should have a bitmap
         std::unordered_map<void *, llvm::BitVector> instr2bitmap;
         unsigned i = 0;
-        
+
         for (auto& inst: llvm::instructions(F)) {
             instr_vec[i] = &inst;
             // errs()<<"INSTR: "<<inst<<" at "<<&inst<<"\n";
            if (isa<CallInst>(&inst)){
                 CallInst * call_instr = cast<CallInst>(&inst);
                 Function * callee_ptr = call_instr->getCalledFunction();
-
+                // Make sure this instruction belongs to one of these basic functions
                 if (fptr2name.find(callee_ptr) != fptr2name.end()) {
                     // find one call_instr that calls one of CAT functions  
                     std::string callee_name = fptr2name[callee_ptr];
                     if (callee_name != "CAT_get") {
                         
                         GEN.set(i);
-                    
-                        // if (callee_name == "CAT_new") {
-                        //     instr2bitmap[call_instr] = llvm::BitVector(NumInstrs, 0);
-                        //     instr2bitmap[call_instr].set(i);
-                        // } else {
-                        //     // get first operand if CAT_set, CAT_add, CAT_sub
-                        //     void * arg0 = call_instr->getArgOperand(0);
-                        //     errs()<< arg0 << "\n";
-                        //     instr2bitmap[arg0].set(i);
-                        // }
-                        void * key;
+
                         if (callee_name == "CAT_new") {
-                            key = call_instr;
+                            instr2bitmap[call_instr] = llvm::BitVector(NumInstrs, 0);
+                            instr2bitmap[call_instr].set(i);
                         } else {
                             // get first operand if CAT_set, CAT_add, CAT_sub
-                            void * arg0 = call_instr->getArgOperand(0);
-                            key = arg0;
-                        }
-                        
-                        if (instr2bitmap.find(key) == instr2bitmap.end()) {
-                            instr2bitmap[key] = llvm::BitVector(NumInstrs, 0);
-                        }
+                            // What if the operands point to PHI node?
+                            //Function * arg0 = dyn_cast<Function>(call_instr->getArgOperand(0));
 
-                        instr2bitmap[key].set(i);
+                            // call instruction pointer
+                            void * key;
+                            if (callee_name == "CAT_new") {
+                                key = call_instr;
+                            } else {
+                                // get first operand if CAT_set, CAT_add, CAT_sub
+                                void * arg0 = call_instr->getArgOperand(0);
+                                key = arg0;
+                            }
 
-                    }   
+                            if (instr2bitmap.find(key) == instr2bitmap.end()) {
+                                instr2bitmap[key] = llvm::BitVector(NumInstrs, 0);
+                            }
+
+                            instr2bitmap[key].set(i);
+                        }
+                    }
                 }
             }
             i++;
         }
+        //errs()<<"END\n";
 
 
         for (i = 0; i < instr_vec.size(); i++) {
@@ -208,6 +210,100 @@ struct CAT : public FunctionPass {
         }
     }
 
+    void H1_GEN_KILL2(Function &F){
+        unsigned NumInstrs = F.getInstructionCount();
+        // every instruction should have a bitmap
+        std::unordered_map<void *, llvm::BitVector> instr2bitmap;
+        unsigned i = 0;
+        for (Instruction &inst : instructions(F)) {
+            if (isa<CallInst>(&inst)){
+                CallInst * call_instr = cast<CallInst>(&inst);
+                Function * callee_ptr = call_instr->getCalledFunction();
+                // Make sure this instruction belongs to one of these basic functions
+                if (fptr2name.find(callee_ptr) != fptr2name.end()) {
+                    // find one call_instr that calls one of CAT functions
+                    std::string callee_name = fptr2name[callee_ptr];
+                    if (callee_name != "CAT_get") {
+                        GEN.set(i);
+                        if (callee_name == "CAT_new") {
+                            instr2bitmap[call_instr] = llvm::BitVector(NumInstrs, 0);
+                            instr2bitmap[call_instr].set(i);
+                        } else {
+
+                        }
+                        instr2bitmap[call_instr].set(i);
+                    }
+                }
+            }
+            i++;
+        }
+
+        i = 0;
+        for(Instruction &inst : instructions(F)){
+           if(GEN.test(i)){
+               if(isa<CallInst>(&inst)){
+                   CallInst * call_instr = cast<CallInst>(&inst);
+                   Function * callee_ptr = dyn_cast<Function>(call_instr->getArgOperand(0)) ;
+                   if(callee_ptr!= nullptr){
+                       if (fptr2name.find(callee_ptr) != fptr2name.end()) {
+                           // find one call_instr that calls one of CAT functions
+                           std::string callee_name = fptr2name[callee_ptr];
+                           if (callee_name != "CAT_get") {
+
+                           }
+                       }
+                   }
+
+
+               }
+           }
+           i++;
+        }
+    }
+
+    // BB implementation
+    void H1_BB_init(Function &F){
+        BB_GEN = std::unordered_map<llvm::BasicBlock *, llvm::BitVector>();
+        BB_KILL = std::unordered_map<llvm::BasicBlock *, llvm::BitVector>();
+    }
+    void H1_BB_GEN_KILL(Function &F){
+        unsigned NumInstr = F.getInstructionCount();
+        unsigned i = 0;
+        // BB_GEN
+        for(BasicBlock &bb : F){
+            BB_GEN[&bb] = llvm::BitVector(NumInstr,0);
+            BB_KILL[&bb] = llvm::BitVector(NumInstr, 0);
+            // just focusing on this basic block
+            for(Instruction &inst : bb){
+                if(isa<CallInst>(&inst)){
+                    CallInst * call_instr = cast<CallInst>(&inst);
+                    Function * callee_ptr = call_instr->getCalledFunction();
+                    if (fptr2name.find(callee_ptr) != fptr2name.end()){
+                        std::string callee_name = fptr2name[callee_ptr];
+                        if(callee_name!="CAT_get")
+                            BB_GEN[&bb].set(i);
+                    }
+                }
+                i++;
+            }
+        }
+
+        //BB_KILL
+        unsigned j = 0;
+        for(BasicBlock &bb : F){
+
+            for (Instruction &instr : bb){
+                if(BB_GEN[&bb][j]){
+                    CallInst *call_instr = cast<CallInst>(&instr);
+                    void *arg0 = call_instr->getArgOperand(0);
+
+                }
+                j++;
+            }
+        }
+
+
+    }
     void H1_output(std::string & func_name ) {
         errs() << "Function \"" << func_name << "\" " << '\n';
         for (int i = 0; i < instr_vec.size(); i++){
@@ -274,7 +370,7 @@ struct CAT : public FunctionPass {
                 if (GEN[inst_counter]) BB_KILL[&bb][inst_counter] = 0;
                 inst_counter++;
             }
-             
+
         }
         // IN/OUT
         bool changed;
@@ -291,7 +387,7 @@ struct CAT : public FunctionPass {
                 INTERSECTION &= BB_IN[&bb];
                 OUT_TEMP ^= INTERSECTION;
                 OUT_TEMP |= BB_GEN[&bb];
-                
+
                 if (!changed) changed = (OUT_TEMP!=BB_OUT[&bb]);
                 BB_OUT[&bb] = OUT_TEMP;
             }
