@@ -378,7 +378,7 @@ struct CAT : public FunctionPass {
     }
 
     // expect cat_new or cat_set call
-    bool get_val_const_op(CallInst * const_cat_call, int64_t *res){
+    bool get_const_CATnew_CATset(CallInst * const_cat_call, int64_t *res){
         Value * arg;
         
         if (IS_CAT_set(const_cat_call->getCalledFunction())){
@@ -430,6 +430,8 @@ struct CAT : public FunctionPass {
          * (instr2bitmap[arg] & INSTR_IN[&inst]).count() must be one to be a constant 
          * 
          * */
+        // TODO: potential optimizatino here
+        // one arg could have multiple IN definition, but happen to have same value
         if (defs_arg.count() != 1) return false;
 
         // Get the only definition available for current instruction
@@ -443,14 +445,23 @@ struct CAT : public FunctionPass {
         Function * def_callee = def_call_instr->getCalledFunction();
         if (!IS_CONST_CAT_OP(def_callee)) return false;
 
-        bool is_const = get_val_const_op(def_call_instr, res);
+        bool is_const = get_const_CATnew_CATset(def_call_instr, res);
 
         return is_const;
     }
 
+    void replace_from_map(std::unordered_map<llvm::CallInst *, Value *> & replace_map) {
+        for (auto & kv: replace_map) {
+            BasicBlock::iterator ii(kv.first);
+            BasicBlock * bb = kv.first->getParent();
+            ReplaceInstWithValue(bb->getInstList(), ii, kv.second);
+        }
+    }
+
     void constant_folding(Function & F) {
         unsigned inst_counter = 0;
-        std::unordered_map<llvm::CallInst *, int64_t> toFold;
+        std::unordered_map<llvm::CallInst *, Value *> toFold;
+        std::unordered_map<llvm::CallInst *, int64_t> toFold_helper;
         for (BasicBlock &bb : F){
             for(Instruction &inst : bb){
                 // we know INSTR_IN, INSTR_OUT
@@ -469,7 +480,8 @@ struct CAT : public FunctionPass {
                         int64_t substitution = (IS_CAT_add(callee_ptr) ? arg1_val + arg2_val : arg1_val - arg2_val);
                         
                         if (arg1_const && arg2_const) {
-                            toFold[call_instr] = substitution;
+                            // toFold[call_instr] = build_cat_set(call_instr, substitution);
+                            toFold_helper[call_instr] = substitution;
                         }
                     }
                 }
@@ -477,19 +489,15 @@ struct CAT : public FunctionPass {
             }
         }
 
-        for (auto & kv: toFold) {
-            CallInst * call_instr = kv.first;
-            Value * set_generated = build_cat_set(call_instr, kv.second);
-
-            BasicBlock::iterator ii(call_instr);
-            BasicBlock * bb = call_instr->getParent();
-            ReplaceInstWithValue(bb->getInstList(), ii, set_generated);
+        for (auto &kv: toFold_helper) {
+            toFold[kv.first] = build_cat_set(kv.first, kv.second);
         }
+        replace_from_map(toFold);
     }
 
     void constant_propagation(Function & F) {
         unsigned inst_counter = 0;
-        std::unordered_map<llvm::CallInst *, int64_t> toPropogate;
+        std::unordered_map<llvm::CallInst *, Value *> toPropogate;
         for (BasicBlock &bb : F){
             for(Instruction &inst : bb){
                 if (isa<CallInst>(&inst)) {
@@ -501,22 +509,14 @@ struct CAT : public FunctionPass {
                         bool arg_const = check_constant(call_instr, arg, &arg_val);
 
                         if (arg_const) {
-                            toPropogate[call_instr] = arg_val;
+                            toPropogate[call_instr] = build_constint(arg_val);
                         }
                     }
                 }
             }
         }
 
-        for (auto & kv: toPropogate) {
-            CallInst * call_instr = kv.first;
-            Value * const_substitute = build_constint(kv.second);
-               
-             
-            BasicBlock::iterator ii(call_instr);
-            BasicBlock * bb = call_instr->getParent();
-            ReplaceInstWithValue(bb->getInstList(), ii, const_substitute);
-        }
+        replace_from_map(toPropogate);
 
     }
 
