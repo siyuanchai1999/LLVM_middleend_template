@@ -15,6 +15,8 @@
 #include "llvm/ADT/BitVector.h"
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
+#include "llvm/IR/Constants.h"
+#include "llvm/IR/IRBuilder.h"
 
 #include <set>
 #include <unordered_set>
@@ -23,10 +25,10 @@
 #include <unordered_map>
 using namespace llvm;
  
- 
 namespace {
 struct CAT : public FunctionPass {
     static char ID; 
+    Module *currentModule;
     // map(caller_name, (callee_name, count))
     std::set<std::string> func_set = {
         "CAT_new",
@@ -38,37 +40,55 @@ struct CAT : public FunctionPass {
     
     std::unordered_map<Function *, std::string> fptr2name;
     std::unordered_map<Function *, int> fptr2cnt;
+    Function * CAT_new_ptr;
+    Function * CAT_add_ptr;
+    Function * CAT_sub_ptr;
+    Function * CAT_get_ptr;
+    Function * CAT_set_ptr;
+#define IS_CAT_new(fptr) (fptr == CAT_new_ptr)
+#define IS_CAT_add(fptr) (fptr == CAT_add_ptr)
+#define IS_CAT_sub(fptr) (fptr == CAT_sub_ptr)
+#define IS_CAT_get(fptr) (fptr == CAT_get_ptr)
+#define IS_CAT_set(fptr) (fptr == CAT_set_ptr)
 
+#define IS_CONST_CAT_OP(fptr) (IS_CAT_set(fptr) || IS_CAT_new(fptr))
     //HW1
     llvm::BitVector GEN;
     std::vector<llvm::Instruction *> instr_vec;
     std::vector<llvm::BitVector> KILL;
-
+    std::unordered_map<void *, llvm::BitVector> instr2bitmap;
 
     //HW2
-    std::unordered_map<llvm::Instruction *, llvm::BitVector> IN, OUT;
+    std::unordered_map<llvm::Instruction *, llvm::BitVector> INSTR_IN, INSTR_OUT;
     std::unordered_map<llvm::BasicBlock *,llvm::BitVector> BB_GEN,BB_KILL,BB_IN,BB_OUT;
-
+    
+    
     CAT() : FunctionPass(ID) {}
 
     // This function is invoked once at the initialization phase of the compiler
     // The LLVM IR of functions isn't ready at this point
     bool doInitialization (Module &M) override {
         // errs() << "Hello LLVM World at \"doInitialization\"\n" ;
+        currentModule = &M;
         for (const std::string & str : func_set) {
             Function * fptr = M.getFunction(StringRef(str));
             fptr2name[fptr] = str;
+            if (str == "CAT_new") {CAT_new_ptr = fptr;}
+            if (str == "CAT_add") {CAT_add_ptr = fptr;}
+            if (str == "CAT_sub") {CAT_sub_ptr = fptr;}
+            if (str == "CAT_get") {CAT_get_ptr = fptr;}
+            if (str == "CAT_set") {CAT_set_ptr = fptr;}
         }
         return false;
         
     }
+
 
     // This function is invoked once per function compiled
     // The LLVM IR of the input functions is ready and it can be analyzed and/or transformed
     bool runOnFunction (Function &F) override {
       // errs() << "Hello LLVM World at \"runOnFunction\"\n" ;
         std::string caller_name = F.getName().str();
-
         H0_init();
         H0_function_count(F);
         // H0_output(caller_name);
@@ -77,18 +97,13 @@ struct CAT : public FunctionPass {
         H1_GEN_KILL(F);
         // H1_output(caller_name);
 
-       H2_init(F);
-       H2_IN_OUT(F);
-       H2_output(caller_name,F);
-        //233
-        
+        H2_init(F);
+        H2_IN_OUT(F);
+        instruction_IN_OUT(F);
+        // H2_output(caller_name,F);
 
-        // H1_output(
-        //     caller_name,  /* function name*/
-        //     GEN,
-        //     KILL,
-        //     instr_vec
-        // );
+        constant_folding(F);
+        constant_propagation(F);
 
         return false;
     }
@@ -137,58 +152,57 @@ struct CAT : public FunctionPass {
         GEN = llvm::BitVector(NumInstrs, 0);
         KILL = std::vector<llvm::BitVector>(NumInstrs, llvm::BitVector(NumInstrs, 0));
         instr_vec = std::vector<llvm::Instruction *>(NumInstrs, NULL);
+        instr2bitmap = std::unordered_map<void *, llvm::BitVector>();
     }
 
     void H1_GEN_KILL(Function &F) {
         unsigned NumInstrs = F.getInstructionCount();
-        // every instruction should have a bitmap
-        std::unordered_map<void *, llvm::BitVector> instr2bitmap;
+        // std::unordered_map<void *, llvm::BitVector> instr2bitmap;
         unsigned i = 0;
-
+        
         for (auto& inst: llvm::instructions(F)) {
             instr_vec[i] = &inst;
             // errs()<<"INSTR: "<<inst<<" at "<<&inst<<"\n";
            if (isa<CallInst>(&inst)){
                 CallInst * call_instr = cast<CallInst>(&inst);
                 Function * callee_ptr = call_instr->getCalledFunction();
-                // Make sure this instruction belongs to one of these basic functions
+
                 if (fptr2name.find(callee_ptr) != fptr2name.end()) {
                     // find one call_instr that calls one of CAT functions  
                     std::string callee_name = fptr2name[callee_ptr];
                     if (callee_name != "CAT_get") {
                         
                         GEN.set(i);
-
+                    
+                        // if (callee_name == "CAT_new") {
+                        //     instr2bitmap[call_instr] = llvm::BitVector(NumInstrs, 0);
+                        //     instr2bitmap[call_instr].set(i);
+                        // } else {
+                        //     // get first operand if CAT_set, CAT_add, CAT_sub
+                        //     void * arg0 = call_instr->getArgOperand(0);
+                        //     errs()<< arg0 << "\n";
+                        //     instr2bitmap[arg0].set(i);
+                        // }
+                        void * key;
                         if (callee_name == "CAT_new") {
-                            instr2bitmap[call_instr] = llvm::BitVector(NumInstrs, 0);
-                            instr2bitmap[call_instr].set(i);
+                            key = call_instr;
                         } else {
                             // get first operand if CAT_set, CAT_add, CAT_sub
-                            // What if the operands point to PHI node?
-                            //Function * arg0 = dyn_cast<Function>(call_instr->getArgOperand(0));
-
-                            // call instruction pointer
-                            void * key;
-                            if (callee_name == "CAT_new") {
-                                key = call_instr;
-                            } else {
-                                // get first operand if CAT_set, CAT_add, CAT_sub
-                                void * arg0 = call_instr->getArgOperand(0);
-                                key = arg0;
-                            }
-
-                            if (instr2bitmap.find(key) == instr2bitmap.end()) {
-                                instr2bitmap[key] = llvm::BitVector(NumInstrs, 0);
-                            }
-
-                            instr2bitmap[key].set(i);
+                            void * arg0 = call_instr->getArgOperand(0);
+                            key = arg0;
                         }
-                    }
+                        
+                        if (instr2bitmap.find(key) == instr2bitmap.end()) {
+                            instr2bitmap[key] = llvm::BitVector(NumInstrs, 0);
+                        }
+
+                        instr2bitmap[key].set(i);
+
+                    }   
                 }
             }
             i++;
         }
-        //errs()<<"END\n";
 
 
         for (i = 0; i < instr_vec.size(); i++) {
@@ -210,100 +224,6 @@ struct CAT : public FunctionPass {
         }
     }
 
-    void H1_GEN_KILL2(Function &F){
-        unsigned NumInstrs = F.getInstructionCount();
-        // every instruction should have a bitmap
-        std::unordered_map<void *, llvm::BitVector> instr2bitmap;
-        unsigned i = 0;
-        for (Instruction &inst : instructions(F)) {
-            if (isa<CallInst>(&inst)){
-                CallInst * call_instr = cast<CallInst>(&inst);
-                Function * callee_ptr = call_instr->getCalledFunction();
-                // Make sure this instruction belongs to one of these basic functions
-                if (fptr2name.find(callee_ptr) != fptr2name.end()) {
-                    // find one call_instr that calls one of CAT functions
-                    std::string callee_name = fptr2name[callee_ptr];
-                    if (callee_name != "CAT_get") {
-                        GEN.set(i);
-                        if (callee_name == "CAT_new") {
-                            instr2bitmap[call_instr] = llvm::BitVector(NumInstrs, 0);
-                            instr2bitmap[call_instr].set(i);
-                        } else {
-
-                        }
-                        instr2bitmap[call_instr].set(i);
-                    }
-                }
-            }
-            i++;
-        }
-
-        i = 0;
-        for(Instruction &inst : instructions(F)){
-           if(GEN.test(i)){
-               if(isa<CallInst>(&inst)){
-                   CallInst * call_instr = cast<CallInst>(&inst);
-                   Function * callee_ptr = dyn_cast<Function>(call_instr->getArgOperand(0)) ;
-                   if(callee_ptr!= nullptr){
-                       if (fptr2name.find(callee_ptr) != fptr2name.end()) {
-                           // find one call_instr that calls one of CAT functions
-                           std::string callee_name = fptr2name[callee_ptr];
-                           if (callee_name != "CAT_get") {
-
-                           }
-                       }
-                   }
-
-
-               }
-           }
-           i++;
-        }
-    }
-
-    // BB implementation
-    void H1_BB_init(Function &F){
-        BB_GEN = std::unordered_map<llvm::BasicBlock *, llvm::BitVector>();
-        BB_KILL = std::unordered_map<llvm::BasicBlock *, llvm::BitVector>();
-    }
-    void H1_BB_GEN_KILL(Function &F){
-        unsigned NumInstr = F.getInstructionCount();
-        unsigned i = 0;
-        // BB_GEN
-        for(BasicBlock &bb : F){
-            BB_GEN[&bb] = llvm::BitVector(NumInstr,0);
-            BB_KILL[&bb] = llvm::BitVector(NumInstr, 0);
-            // just focusing on this basic block
-            for(Instruction &inst : bb){
-                if(isa<CallInst>(&inst)){
-                    CallInst * call_instr = cast<CallInst>(&inst);
-                    Function * callee_ptr = call_instr->getCalledFunction();
-                    if (fptr2name.find(callee_ptr) != fptr2name.end()){
-                        std::string callee_name = fptr2name[callee_ptr];
-                        if(callee_name!="CAT_get")
-                            BB_GEN[&bb].set(i);
-                    }
-                }
-                i++;
-            }
-        }
-
-        //BB_KILL
-        unsigned j = 0;
-        for(BasicBlock &bb : F){
-
-            for (Instruction &instr : bb){
-                if(BB_GEN[&bb][j]){
-                    CallInst *call_instr = cast<CallInst>(&instr);
-                    void *arg0 = call_instr->getArgOperand(0);
-
-                }
-                j++;
-            }
-        }
-
-
-    }
     void H1_output(std::string & func_name ) {
         errs() << "Function \"" << func_name << "\" " << '\n';
         for (int i = 0; i < instr_vec.size(); i++){
@@ -335,6 +255,9 @@ struct CAT : public FunctionPass {
         BB_OUT = std::unordered_map<llvm::BasicBlock *, llvm::BitVector>();
         BB_GEN = std::unordered_map<llvm::BasicBlock *, llvm::BitVector>();
         BB_KILL = std::unordered_map<llvm::BasicBlock *, llvm::BitVector>();
+
+        INSTR_IN = std::unordered_map<llvm::Instruction *, llvm::BitVector>();
+        INSTR_OUT = std::unordered_map<llvm::Instruction *, llvm::BitVector>();
     }
 
     llvm::BitVector bitwise_diff(llvm::BitVector & A, llvm::BitVector & B) {
@@ -370,7 +293,7 @@ struct CAT : public FunctionPass {
                 if (GEN[inst_counter]) BB_KILL[&bb][inst_counter] = 0;
                 inst_counter++;
             }
-
+             
         }
         // IN/OUT
         bool changed;
@@ -387,7 +310,7 @@ struct CAT : public FunctionPass {
                 INTERSECTION &= BB_IN[&bb];
                 OUT_TEMP ^= INTERSECTION;
                 OUT_TEMP |= BB_GEN[&bb];
-
+                
                 if (!changed) changed = (OUT_TEMP!=BB_OUT[&bb]);
                 BB_OUT[&bb] = OUT_TEMP;
             }
@@ -399,34 +322,200 @@ struct CAT : public FunctionPass {
         errs() << "Function \"" << func_name << "\" " << '\n';
         unsigned inst_counter = 0;
         for (BasicBlock &bb : F){
-            BitVector INSTR_IN = BB_IN[&bb];
-            BitVector INSTR_OUT = BB_IN[&bb];
             for(Instruction &inst : bb){
                 errs() << "INSTRUCTION: " << inst << '\n';
                 errs() << "***************** IN\n{\n";
-                INSTR_IN = INSTR_OUT;
-                print_bitvector(INSTR_IN);
+                print_bitvector(INSTR_IN[&inst]);
                 errs() << "}\n";
                 errs() << "**************************************\n";
                 errs() << "***************** OUT\n{\n";
 
-                BitVector OUT_TEMP = INSTR_IN;
-                BitVector INTERSECTION = KILL[inst_counter];
-                INTERSECTION &= INSTR_IN;
-                OUT_TEMP ^= INTERSECTION;
-                if(GEN.test(inst_counter)){
-                    OUT_TEMP.set(inst_counter);
-                }
 
-                INSTR_OUT = OUT_TEMP;
-
-
-                print_bitvector(INSTR_OUT);
+                print_bitvector(INSTR_OUT[&inst]);
                 errs() << "}\n";
                 errs() << "**************************************\n";
                 errs() << "\n\n\n";
                 inst_counter++;
             }
+        }
+
+    }
+
+    void instruction_IN_OUT( Function &F){
+        unsigned inst_counter = 0;
+        for (BasicBlock &bb : F){
+            BitVector local_INSTR_IN = BB_IN[&bb];
+            BitVector local_INSTR_OUT = BB_IN[&bb];
+            for(Instruction &inst : bb){
+                local_INSTR_IN = local_INSTR_OUT;
+
+                
+                //TODO: need to be replaced by bitwise_diff function later
+                BitVector OUT_TEMP = local_INSTR_IN;
+                BitVector INTERSECTION = KILL[inst_counter];
+                INTERSECTION &= local_INSTR_IN;
+                OUT_TEMP ^= INTERSECTION;
+                if(GEN.test(inst_counter)){
+                    OUT_TEMP.set(inst_counter);
+                }
+
+                local_INSTR_OUT = OUT_TEMP;
+
+
+                INSTR_IN[&inst] = local_INSTR_IN;
+                INSTR_OUT[&inst] = local_INSTR_OUT;
+                inst_counter++;
+            }
+        }
+    }
+
+    // return the callee fptr if inst_ptr is call function
+    Function * get_callee_ptr(Instruction * inst_ptr) {
+        if (isa<CallInst>(inst_ptr)){
+            return cast<CallInst>(inst_ptr)->getCalledFunction();
+        }
+        return NULL;
+    }
+
+    // expect cat_new or cat_set call
+    bool get_val_const_op(CallInst * const_cat_call, int64_t *res){
+        Value * arg;
+        
+        if (IS_CAT_set(const_cat_call->getCalledFunction())){
+            // cat_set(d, xx)
+            arg = const_cat_call->getArgOperand(1);
+        } else {
+            // cat_new(xx)
+            arg = const_cat_call->getArgOperand(0);
+        }
+
+        if (isa<ConstantInt>(arg)){
+            
+            *res = cast<ConstantInt>(arg)->getSExtValue();
+            return true;
+        }
+        return false;
+    }
+
+    // create set instruction before cat_add or cat_sub
+    Value * build_cat_set(CallInst * call_instr, int64_t set_val) {
+        IRBuilder<> builder(call_instr);
+        std::vector<Value *> arg_vec;
+        arg_vec.push_back(call_instr->getArgOperand(0));
+
+        Type * llvm_int64 =  IntegerType::get(currentModule->getContext(), 64);
+        Value * val = ConstantInt::get(llvm_int64, set_val);
+        arg_vec.push_back(val);
+        ArrayRef<Value *> arg_arr_ref = ArrayRef<Value *>(arg_vec);
+        // arg_arr.
+        Value * added_inst = builder.CreateCall(CAT_set_ptr, arg_arr_ref);
+        return added_inst;
+    }
+
+
+    Value *build_constint(int64_t num) {
+        Type * llvm_int64 =  IntegerType::get(currentModule->getContext(), 64);
+        Value * val = ConstantInt::get(llvm_int64, num);
+        return val;
+    }
+    // Check if arg of call_instr can be simpliefed with constant propogation
+    // if so, return true, and store constant value into res
+    // if not, return false, nothing should be changed to res
+    bool check_constant(CallInst * call_instr, Value * arg, int64_t * res){
+        BitVector defs_arg = instr2bitmap[arg];
+        defs_arg &= INSTR_IN[(Instruction *)call_instr];
+        /**
+         * INSTR_IN[&inst] must contain one and only one definition of arg
+         * In other word,
+         * (instr2bitmap[arg] & INSTR_IN[&inst]).count() must be one to be a constant 
+         * 
+         * */
+        if (defs_arg.count() != 1) return false;
+
+        // Get the only definition available for current instruction
+        Instruction * def_instr = instr_vec[defs_arg.find_first()];
+        
+        // not a call instruction, might be a phi???
+        if (!isa<CallInst>(def_instr)) return false;
+
+        CallInst * def_call_instr = cast<CallInst>(def_instr);
+        // must be a cat_set or cat_new for constant propagation or folding
+        Function * def_callee = def_call_instr->getCalledFunction();
+        if (!IS_CONST_CAT_OP(def_callee)) return false;
+
+        bool is_const = get_val_const_op(def_call_instr, res);
+
+        return is_const;
+    }
+
+    void constant_folding(Function & F) {
+        unsigned inst_counter = 0;
+        std::unordered_map<llvm::CallInst *, int64_t> toFold;
+        for (BasicBlock &bb : F){
+            for(Instruction &inst : bb){
+                // we know INSTR_IN, INSTR_OUT
+                if (isa<CallInst>(&inst)) {
+                    CallInst * call_instr = cast<CallInst>(&inst);
+                    Function * callee_ptr = call_instr->getCalledFunction();
+                    if (IS_CAT_add(callee_ptr) || IS_CAT_sub(callee_ptr)) {
+                        Value * arg0 = call_instr->getArgOperand(0);
+                        Value * arg1 = call_instr->getArgOperand(1);
+                        Value * arg2 = call_instr->getArgOperand(2);
+                        
+                        int64_t arg1_val, arg2_val;
+                        bool arg1_const = check_constant(call_instr, arg1, &arg1_val);
+                        bool arg2_const = check_constant(call_instr, arg2, &arg2_val);
+
+                        int64_t substitution = (IS_CAT_add(callee_ptr) ? arg1_val + arg2_val : arg1_val - arg2_val);
+                        
+                        if (arg1_const && arg2_const) {
+                            toFold[call_instr] = substitution;
+                        }
+                    }
+                }
+                inst_counter++;
+            }
+        }
+
+        for (auto & kv: toFold) {
+            CallInst * call_instr = kv.first;
+            Value * set_generated = build_cat_set(call_instr, kv.second);
+
+            BasicBlock::iterator ii(call_instr);
+            BasicBlock * bb = call_instr->getParent();
+            ReplaceInstWithValue(bb->getInstList(), ii, set_generated);
+        }
+    }
+
+    void constant_propagation(Function & F) {
+        unsigned inst_counter = 0;
+        std::unordered_map<llvm::CallInst *, int64_t> toPropogate;
+        for (BasicBlock &bb : F){
+            for(Instruction &inst : bb){
+                if (isa<CallInst>(&inst)) {
+                    CallInst * call_instr = cast<CallInst>(&inst);
+                    Function * callee_ptr = call_instr->getCalledFunction();
+                    if(IS_CAT_get(callee_ptr)) {
+                        Value * arg = call_instr->getArgOperand(0);
+                        int64_t arg_val; 
+                        bool arg_const = check_constant(call_instr, arg, &arg_val);
+
+                        if (arg_const) {
+                            toPropogate[call_instr] = arg_val;
+                        }
+                    }
+                }
+            }
+        }
+
+        for (auto & kv: toPropogate) {
+            CallInst * call_instr = kv.first;
+            Value * const_substitute = build_constint(kv.second);
+               
+             
+            BasicBlock::iterator ii(call_instr);
+            BasicBlock * bb = call_instr->getParent();
+            ReplaceInstWithValue(bb->getInstList(), ii, const_substitute);
         }
 
     }
