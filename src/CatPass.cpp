@@ -377,25 +377,16 @@ struct CAT : public FunctionPass {
         return NULL;
     }
 
-    // expect cat_new or cat_set call
-    bool get_const_CATnew_CATset(CallInst * const_cat_call, int64_t *res){
-        Value * arg;
-        
-        if (IS_CAT_set(const_cat_call->getCalledFunction())){
-            // cat_set(d, xx)
-            arg = const_cat_call->getArgOperand(1);
-        } else {
-            // cat_new(xx)
-            arg = const_cat_call->getArgOperand(0);
+    template<class T>
+    bool vec_all_equal(std::vector<T> &v) {
+        if (v.size() == 0) return true;
+        T head = v[0];
+        for (unsigned i = 1; i < v.size(); i++) {
+            if (head != v[i]) return false; 
         }
-
-        if (isa<ConstantInt>(arg)){
-            
-            *res = cast<ConstantInt>(arg)->getSExtValue();
-            return true;
-        }
-        return false;
+        return true;
     }
+
 
     // create set instruction before cat_add or cat_sub
     Value * build_cat_set(CallInst * call_instr, int64_t set_val) {
@@ -418,6 +409,38 @@ struct CAT : public FunctionPass {
         Value * val = ConstantInt::get(llvm_int64, num);
         return val;
     }
+
+    /**
+     *  check if given @instr defines a constant
+     *  if so result is stored in res, and return true
+     *  otherwise return false, res is not touched
+     * */ 
+    bool check_constant_instr(Instruction * instr, int64_t * res) {
+        if (!isa<CallInst>(instr)) return false;
+
+        CallInst * call_instr = cast<CallInst>(instr);
+        // must be a cat_set or cat_new for constant propagation or folding
+        Function * callee = call_instr->getCalledFunction();
+        if (!IS_CONST_CAT_OP(callee)) return false;
+
+        // bool is_const = get_const_CATnew_CATset(call_instr, res);
+        Value * arg;
+        
+        if (IS_CAT_set(callee)){
+            // cat_set(d, xx)
+            arg = call_instr->getArgOperand(1);
+        } else {
+            // cat_new(xx)
+            arg = call_instr->getArgOperand(0);
+        }
+
+        if (isa<ConstantInt>(arg)){
+            
+            *res = cast<ConstantInt>(arg)->getSExtValue();
+            return true;
+        }
+        return false; 
+    }
     // Check if arg of call_instr can be simpliefed with constant propogation
     // if so, return true, and store constant value into res
     // if not, return false, nothing should be changed to res
@@ -432,22 +455,31 @@ struct CAT : public FunctionPass {
          * */
         // TODO: potential optimizatino here
         // one arg could have multiple IN definition, but happen to have same value
-        if (defs_arg.count() != 1) return false;
+        if (defs_arg.count() == 0) return false;
 
-        // Get the only definition available for current instruction
-        Instruction * def_instr = instr_vec[defs_arg.find_first()];
+        // Get the all definition available for current instruction
+        unsigned idx = defs_arg.find_first();
+        bool is_const;
+        int64_t const_val;
+        std::vector<int64_t> const_vec;
+        while (idx != -1) {
+            Instruction * def_instr = instr_vec[idx];
+            is_const = check_constant_instr(def_instr, &const_val);
+
+            // one definition is not constant, return false directly
+            if (!is_const) return false;
+
+            const_vec.push_back(const_val);
+
+            idx = defs_arg.find_next(idx);
+        }
         
-        // not a call instruction, might be a phi???
-        if (!isa<CallInst>(def_instr)) return false;
+        bool all_const_eq = vec_all_equal(const_vec);
+        if (!all_const_eq) return false;
 
-        CallInst * def_call_instr = cast<CallInst>(def_instr);
-        // must be a cat_set or cat_new for constant propagation or folding
-        Function * def_callee = def_call_instr->getCalledFunction();
-        if (!IS_CONST_CAT_OP(def_callee)) return false;
-
-        bool is_const = get_const_CATnew_CATset(def_call_instr, res);
-
-        return is_const;
+        *res = const_vec[0];
+        return true;
+        
     }
 
     void replace_from_map(std::unordered_map<llvm::CallInst *, Value *> & replace_map) {
