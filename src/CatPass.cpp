@@ -23,6 +23,7 @@
 #include <vector>
 #include <map>
 #include <unordered_map>
+#include <queue>
 using namespace llvm;
  
 namespace {
@@ -45,6 +46,9 @@ struct CAT : public FunctionPass {
     Function * CAT_sub_ptr;
     Function * CAT_get_ptr;
     Function * CAT_set_ptr;
+
+#define IN_MAP(map, key) (map.find(key) != map.end())
+#define IN_SET(set, key) (set.find(key) != set.end())
 
 #define IS_CAT_new(fptr) (fptr == CAT_new_ptr)
 #define IS_CAT_add(fptr) (fptr == CAT_add_ptr)
@@ -96,6 +100,7 @@ struct CAT : public FunctionPass {
     // The LLVM IR of the input functions is ready and it can be analyzed and/or transformed
     bool runOnFunction (Function &F) override {
       // errs() << "Hello LLVM World at \"runOnFunction\"\n" ;
+        phi_node_new2set(F);
         std::string caller_name = F.getName().str();
         H0_init();
         H0_function_count(F);
@@ -271,6 +276,7 @@ struct CAT : public FunctionPass {
         INSTR_OUT = std::unordered_map<llvm::Instruction *, llvm::BitVector>();
     }
 
+    // return A - B
     llvm::BitVector bitwise_diff(llvm::BitVector & A, llvm::BitVector & B) {
         llvm::BitVector res = A;
         llvm::BitVector neg_B = B;
@@ -431,6 +437,353 @@ struct CAT : public FunctionPass {
     //     g(d3);
     // }
 
+    /**
+     * visited_phi[phi] returns a set of CAT_new under such phi
+     * */
+    int count_CAT_new_under_Phi(
+        PHINode * phi, 
+        std::map<PHINode *, std::set<Value *>> & visited_phi
+    ) {
+        if (IN_SET(visited_phi, phi)){
+            return visited_phi[phi].size();
+        }
+
+        uint32_t numIncoming = phi->getNumIncomingValues();
+        int cat_new_num = 0;
+
+        for (uint32_t i = 0; i < numIncoming; i++) {
+            Value * inValue = phi->getIncomingValue(i);
+            
+            if(Function * fptr = get_callee_ptr(inValue)){
+                if (IS_CAT_new(fptr)){
+                    CallInst * call_instr = cast<CallInst>(inValue);
+                    visited_phi[phi].insert(call_instr);
+                    cat_new_num++;
+                }
+
+            } else if(isa<PHINode>(inValue)){
+                PHINode * child_phi = cast<PHINode>(inValue);
+                
+                count_CAT_new_under_Phi(
+                    child_phi,
+                    visited_phi
+                );
+
+                cat_new_num += visited_phi[child_phi].size();
+                visited_phi[phi].insert(
+                    visited_phi[child_phi].begin(),
+                    visited_phi[child_phi].end()
+                );
+
+            }
+        }
+
+        return cat_new_num;
+    }
+
+    void add_edge(
+        std::map<llvm::Value *, std::set<llvm::Value *>> &graph,
+        llvm::Value * val_a,
+        llvm::Value * val_b
+    ) {
+        if (!IN_MAP(graph, val_a)){
+            graph[val_a] = std::set<llvm::Value *>();
+        }
+
+        if (!IN_MAP(graph, val_b)){
+            graph[val_b] = std::set<llvm::Value *>();
+        }
+
+        graph[val_a].insert(val_b);
+        graph[val_b].insert(val_a);
+
+    }
+
+    void add_edge_group(
+        std::map<llvm::Value *, std::set<llvm::Value *>> &graph,
+        // PHINode * phi,
+        std::set<Value *> & cat_news
+    ){  
+        std::vector<Value *> cat_new_vec(cat_news.begin(), cat_news.end());
+
+        // for(uint32_t i = 0; i < cat_new_vec.size(); i++){
+        //     for(uint32_t j = i + 1; j < cat_new_vec.size(); j++){
+        //         add_edge(
+        //             graph,
+        //             cat_new_vec[i],
+        //             cat_new_vec[j],
+        //             phi
+        //         );
+        //     }
+        // }
+        for(uint32_t i = 1; i < cat_new_vec.size() ; i++){
+            add_edge(
+                graph,
+                cat_new_vec[i],
+                cat_new_vec[i - 1]
+            );
+        }
+    }
+
+    void DFS(
+        std::map<llvm::Value *, std::set<llvm::Value *>> &graph,
+        std::set<llvm::Value *> & visited,
+        llvm::Value * val_node,
+        std::vector<llvm::Value *> & CC_sub
+        // std::set<llvm::Value *> & CC_edge_sub
+    ) {
+        for (auto & ngbr : graph[val_node]) {
+            if(!IN_SET(visited, ngbr)){
+                
+                visited.insert(ngbr);
+                CC_sub.push_back(ngbr);
+                // CC_edge_sub.insert(kv.second);
+
+                DFS(
+                    graph,
+                    visited,
+                    ngbr,
+                    CC_sub
+                    // CC_edge_sub
+                );
+            }
+        }
+    }
+    
+    void connected_components(
+        std::map<llvm::Value *, std::set<llvm::Value *>> &graph,
+        std::vector<std::vector<llvm::Value *>> & CC
+        // std::vector<std::set<llvm::Value *>> & CC_edge
+    ) {
+        std::set<llvm::Value *> visited;
+        for (auto &kv : graph){
+            if(!IN_SET(visited, kv.first)){
+
+                visited.insert(kv.first);
+                std::vector<llvm::Value *> CC_sub;
+                CC_sub.push_back(kv.first);
+
+                // std::set<llvm::Value *> CC_edge_sub;
+
+                DFS(
+                    graph,
+                    visited,
+                    kv.first,
+                    CC_sub
+                    // CC_edge_sub
+                );
+
+                CC.push_back(CC_sub);
+                // CC_edge.push_back(CC_edge_sub);
+            }
+        }
+    }
+
+    void print_CC(
+        std::vector<std::vector<llvm::Value *>> &CC
+        // std::vector<std::set<llvm::Value *>> & CC_edge
+    ){
+        errs() <<"printing CC\n";
+        for(uint32_t i = 0; i < CC.size(); i++){
+            errs() <<"#" << i << " CC\n";
+            for(uint32_t j = 0; j < CC[i].size(); j++){
+                errs() << *CC[i][j] <<'\n';
+            }
+
+            // errs() <<"Connected over\n";
+            // for (auto it = CC_edge[i].begin(); it != CC_edge[i].end(); it++){
+            //     errs() << **it <<'\n';
+            // }
+
+             errs() <<'\n';
+
+        }
+    }
+
+
+    void print_phi_info(std::map<PHINode *, std::set<Value *>> &visited_phi){
+        errs() <<"printing kv info\n" ;
+        for (auto & kv : visited_phi){
+            errs() << "Phi node: " << *kv.first <<'\n';
+            for (auto &v : kv.second){
+                errs()  << *v <<'\n';
+            }
+        }
+    }
+
+
+    void replace_instr_val(Instruction * instr, Value * val){
+        BasicBlock::iterator ii(instr);
+        BasicBlock * bb = instr->getParent();
+        ReplaceInstWithValue(bb->getInstList(), ii, val);
+    }
+
+    /**
+     * replace body with head
+     * */
+    void CAT_new_to_CAT_set(
+        llvm::CallInst * CAT_new_old,
+        llvm::CallInst * CAT_new_replace
+    ) {
+        IRBuilder<> builder(CAT_new_old);
+
+        Value * val = CAT_new_old->getArgOperand(0);
+        
+        ArrayRef<Value *> arg_arr_ref = ArrayRef<Value *>{CAT_new_replace, val};
+
+        Value * added_set_instr = builder.CreateCall(CAT_set_ptr, arg_arr_ref);
+        
+        // replacement
+        replace_instr_val(CAT_new_old, CAT_new_replace);
+    }
+    
+
+    /**
+     * Create dummy CAT_new at the beginning of the Function
+     * */
+    CallInst * build_CAT_new_Head(Function & F){
+        Instruction * first_instr = &(*instructions(F).begin());
+        IRBuilder<> builder(first_instr);
+
+        Constant * zeroConst = ConstantInt::get(IntegerType::get(currentModule->getContext(), 64), 0, true);
+        // std::vector<Value *> arg_vec{zeroConst};
+        ArrayRef<Value *> arg_arr_ref = ArrayRef<Value *>{zeroConst};
+
+        Value * added_new_instr = builder.CreateCall(CAT_new_ptr, arg_arr_ref);
+        return cast<CallInst>(added_new_instr);
+
+    }
+
+    void merge_Phi_CAT_new(
+        Function & F,
+        std::vector<llvm::Value *> & nodes
+        // std::set<llvm::Value *> & edges
+    ){
+        /**
+         * expect nodes to be all CallInstr on CAT_new
+         * expect edges to be all phi node phi that connects CAT_new 
+         * */
+        
+        // build dummy CAT_new at beginning
+        CallInst * CAT_new_replace = build_CAT_new_Head(F);
+
+        for (uint32_t i = 0; i < nodes.size(); i++) {
+            CallInst * CAT_new_old = cast<CallInst>(nodes[i]);
+            CAT_new_to_CAT_set(
+                CAT_new_old,
+                CAT_new_replace
+            );
+        }
+
+        // for (auto it = edges.begin(); it != edges.end(); it++){
+        //     PHINode * phi = cast<PHINode>(*it);
+        //     replace_instr_val(phi, CAT_new_replace);
+        // }
+        
+    }
+
+    bool merge_single_phi(PHINode *phi) {
+        errs() << "replacing" << *phi  << "at " << phi << '\n';
+        uint32_t numIncoming = phi->getNumIncomingValues();
+
+        std::vector<Value *> inValue_collect(numIncoming);
+        for (uint32_t i = 0; i < numIncoming; i++) {
+            inValue_collect[i] = phi->getIncomingValue(i);                   
+        }
+
+        if (vec_all_equal(inValue_collect)){
+            replace_instr_val(phi, inValue_collect[0]);
+            errs() <<"after replacement\n";
+            errs() << phi << '\n';
+            return true;
+        }
+        
+        return false;
+    }
+
+    void merge_Phi(
+        std::map<PHINode *, std::set<Value *>> &visited_phi
+    ){  
+        std::set<PHINode *> worklist;
+        bool merged_in_round = true;
+
+        for (auto & kv : visited_phi){
+            worklist.insert(kv.first);
+        }
+
+        while (merged_in_round && !worklist.empty())
+        {
+            // create temp as it's hard to erase while iterating
+            std::set<PHINode *> worklist_temp = worklist;
+            merged_in_round = false;
+
+            for (auto & phi : worklist_temp){
+                bool merged = merge_single_phi(phi);
+
+                if (merged){
+                    
+                    worklist_temp.erase(phi);
+                }
+                merged_in_round = merged_in_round || merged;
+            }
+
+            worklist = worklist_temp;
+        }
+        
+    }
+    /**
+     * Go through the function, find all CAT_new linked by Phi node
+     * */
+    void phi_node_new2set(Function & F){
+        // std::unordered_map<PHINode *, std::vector<Value *>> to_merge;
+
+        // graph[cat_new1][cat_new2] -> phi node that connects them
+        std::map<llvm::Value *, std::set<llvm::Value *>> graph;
+
+        std::map<PHINode *, std::set<Value *>> visited_phi;
+
+        for (BasicBlock &bb : F){
+            for(Instruction &inst : bb){
+                if (isa<PHINode>(&inst)){
+                    PHINode * phi = cast<PHINode>(&inst);
+                    
+                    if(!IN_SET(visited_phi, phi)){
+                        int cnt = count_CAT_new_under_Phi(phi, visited_phi);
+
+                        if (cnt >= 2) {
+                            add_edge_group(
+                                graph,
+                                visited_phi[phi]
+                            );
+                        }
+                    }
+                }   
+            }
+        }
+
+        std::vector<std::vector<llvm::Value *>> CC;
+        // std::vector<std::set<llvm::Value *>> CC_edge;
+        connected_components(
+            graph,
+            CC
+            // CC_edge
+        );
+
+        print_CC(CC);
+        print_phi_info(visited_phi);
+
+        for (uint32_t i = 0; i < CC.size(); i++){
+            merge_Phi_CAT_new(
+                F,
+                CC[i]
+            );
+        }
+        
+        // for(auto & kv: to_merge){
+        //     merge_phi_and_new(kv.first, kv.second);
+        // }
+        merge_Phi(visited_phi);
+    }
 
     bool get_CATvar_fromArg(Value * arg, std::vector<CallInst *> & sub_escape){
         if (isa<PHINode>(arg)){
@@ -469,7 +822,7 @@ struct CAT : public FunctionPass {
         return false;
     }
     // return the callee fptr if inst_ptr is call function
-    Function * get_callee_ptr(Instruction * inst_ptr) {
+    Function * get_callee_ptr(Value * inst_ptr) {
         if (isa<CallInst>(inst_ptr)){
             return cast<CallInst>(inst_ptr)->getCalledFunction();
         }
@@ -494,7 +847,7 @@ struct CAT : public FunctionPass {
         arg_vec.push_back(call_instr->getArgOperand(0));
 
         Type * llvm_int64 =  IntegerType::get(currentModule->getContext(), 64);
-        Value * val = ConstantInt::get(llvm_int64, set_val);
+        Value * val = ConstantInt::get(llvm_int64, set_val, true);
         arg_vec.push_back(val);
         ArrayRef<Value *> arg_arr_ref = ArrayRef<Value *>(arg_vec);
         // arg_arr.
@@ -505,7 +858,7 @@ struct CAT : public FunctionPass {
 
     Value *build_constint(int64_t num) {
         Type * llvm_int64 =  IntegerType::get(currentModule->getContext(), 64);
-        Value * val = ConstantInt::get(llvm_int64, num);
+        Value * val = ConstantInt::get(llvm_int64, num, true);
         return val;
     }
 
@@ -595,17 +948,17 @@ struct CAT : public FunctionPass {
          * 
          * */
         
-        if (isa<PHINode>(arg)) {
+        // if (isa<PHINode>(arg)) {
             
-            errs() << * instr <<'\n';
-            errs() << "has argument phi: " <<'\n';
-            errs() << *arg << "\n";
-            errs() << "instr2bitmap[arg]" << "\n";
-            print_bitvector(instr2bitmap[arg]);
-            errs() << "INSTR_IN[instr]" << "\n";
-            print_bitvector(INSTR_IN[instr]);
-             errs() << "\n";
-        }
+        //     errs() << * instr <<'\n';
+        //     errs() << "has argument phi: " <<'\n';
+        //     errs() << *arg << "\n";
+        //     errs() << "instr2bitmap[arg]" << "\n";
+        //     print_bitvector(instr2bitmap[arg]);
+        //     errs() << "INSTR_IN[instr]" << "\n";
+        //     print_bitvector(INSTR_IN[instr]);
+        //      errs() << "\n";
+        // }
         if (defs_arg.count() == 0){
             if (isa<PHINode>(arg)) {
             
