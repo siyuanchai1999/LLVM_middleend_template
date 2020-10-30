@@ -59,12 +59,14 @@ struct CAT : public FunctionPass {
 #define IS_CAT_OP(fptr) ( fptr2name.find(fptr) != fptr2name.end() )
 
 #define IS_CONST_CAT_OP(fptr) (IS_CAT_set(fptr) || IS_CAT_new(fptr))
+
+    std::unordered_set<Function *> user_functions;
     //HW1
     llvm::BitVector GEN;
     std::vector<llvm::Instruction *> instr_vec;
     std::vector<llvm::BitVector> KILL;
     std::unordered_map<void *, llvm::BitVector> instr2bitmap;
-
+    
     //HW2
     std::unordered_map<llvm::Instruction *, llvm::BitVector> INSTR_IN, INSTR_OUT;
     std::unordered_map<llvm::BasicBlock *,llvm::BitVector> BB_GEN,BB_KILL,BB_IN,BB_OUT;
@@ -77,10 +79,11 @@ struct CAT : public FunctionPass {
 #define IN_STORE_TABLE(ptr) ( store_table.find(ptr) != store_table.end() )
 
     // deadcode elimination
-    std::unordered_map<llvm::Instruction *, llvm::BitVector> live_GEN_INST, live_KILL_INST;
-    std::unordered_map<llvm::Instruction *, llvm::BitVector> live_IN_INST, live_OUT_INST;
-    std::unordered_map<llvm::BasicBlock *, llvm::BitVector> live_GEN_BB, live_KILL_BB;
-    std::unordered_map<llvm::BasicBlock *, llvm::BitVector> live_IN_BB, live_OUT_BB;
+    std::unordered_map<llvm::Instruction *, std::set<llvm::Value *>> live_GEN_INST, live_KILL_INST;
+    std::unordered_map<llvm::Instruction *, std::set<llvm::Value *>> live_IN_INST, live_OUT_INST;
+    std::unordered_map<llvm::BasicBlock *, std::set<llvm::Value *>> live_GEN_BB, live_KILL_BB;
+    std::unordered_map<llvm::BasicBlock *, std::set<llvm::Value *>> live_IN_BB, live_OUT_BB;
+    std::set<llvm::Value *> referenced_var;
 
     CAT() : FunctionPass(ID) {}
 
@@ -89,6 +92,14 @@ struct CAT : public FunctionPass {
     bool doInitialization (Module &M) override {
         // errs() << "Hello LLVM World at \"doInitialization\"\n" ;
         currentModule = &M;
+        errs() << "available functions: \n";
+        for (Function & F : M){
+            if(!F.isDeclaration()){
+                user_functions.insert(&F);
+            }
+            
+        }
+
         for (const std::string & str : func_set) {
             Function * fptr = M.getFunction(StringRef(str));
             fptr2name[fptr] = str;
@@ -108,6 +119,7 @@ struct CAT : public FunctionPass {
     bool runOnFunction (Function &F) override {
       // errs() << "Hello LLVM World at \"runOnFunction\"\n" ;
         phi_node_new2set(F);
+        live_analysis_wrapper(F);
         std::string caller_name = F.getName().str();
         H0_init();
         H0_function_count(F);
@@ -125,6 +137,7 @@ struct CAT : public FunctionPass {
         build_store_table(F);
         find_escaped(F);
 
+        
         constant_folding(F);
         constant_propagation(F);
 
@@ -475,7 +488,7 @@ struct CAT : public FunctionPass {
         PHINode * phi, 
         std::map<PHINode *, std::set<Value *>> & visited_phi
     ) {
-        errs() << "counting for " << *phi << '\n';
+        // errs() << "counting for " << *phi << '\n';
         if (IN_SET(visited_phi, phi)){
             return visited_phi[phi].size();
         }
@@ -799,9 +812,9 @@ struct CAT : public FunctionPass {
                     PHINode * phi = cast<PHINode>(&inst);
                     
                     if(!IN_SET(visited_phi, phi)){
-                        errs() << "analyzing " << *phi << '\n';
+                        // errs() << "analyzing " << *phi << '\n';
                         int cnt = count_CAT_new_under_Phi(phi, visited_phi);
-                        errs() << "get cnt = " << cnt << '\n';
+                        // errs() << "get cnt = " << cnt << '\n';
                         if (cnt >= 2) {
                             add_edge_group(
                                 graph,
@@ -813,7 +826,6 @@ struct CAT : public FunctionPass {
             }
         }
 
-        errs() << "fine before CC\n";
         std::vector<std::vector<llvm::Value *>> CC;
         // std::vector<std::set<llvm::Value *>> CC_edge;
         connected_components(
@@ -822,10 +834,9 @@ struct CAT : public FunctionPass {
             // CC_edge
         );
 
-        print_CC(CC);
-        print_phi_info(visited_phi);
+        // print_CC(CC);
+        // print_phi_info(visited_phi);
 
-        errs() << "fine before merge\n";
         for (uint32_t i = 0; i < CC.size(); i++){
             merge_Phi_CAT_new(
                 F,
@@ -1037,7 +1048,7 @@ struct CAT : public FunctionPass {
             BasicBlock * bb = kv.first->getParent();
             ReplaceInstWithValue(bb->getInstList(), ii, kv.second);
         }
-        errs() << "done!\n";
+        
     }
 
     void constant_folding(Function & F) {
@@ -1114,23 +1125,78 @@ struct CAT : public FunctionPass {
     }
 
     void live_analysis_init(Function & F){
-        // std::unordered_map<llvm::Instruction *, llvm::BitVector> live_GEN, live_KILL;
-        // std::unordered_map<llvm::Instruction *, llvm::BitVector> live_IN, live_OUT;
-        // std::unordered_map<llvm::BasicBlock *, llvm::BitVector> live_GEN_BB, live_KILL_BB;
-        // std::unordered_map<llvm::BasicBlock *, llvm::BitVector> live_IN_BB, live_OUT_BB;
+        // std::unordered_map<llvm::Instruction *, std::set<llvm::Instruction *>> live_GEN_INST, live_KILL_INST;
+        // std::unordered_map<llvm::Instruction *, std::set<llvm::Instruction *>> live_IN_INST, live_OUT_INST;
+        // std::unordered_map<llvm::BasicBlock *, std::set<llvm::Instruction *>> live_GEN_BB, live_KILL_BB;
+        // std::unordered_map<llvm::BasicBlock *, std::set<llvm::Instruction *>> live_IN_BB, live_OUT_BB;
         unsigned NumInstrs = F.getInstructionCount();
         for (BasicBlock &bb : F){
-            live_GEN_BB[&bb] = BitVector(NumInstrs, 0);
-            live_KILL_BB[&bb] = BitVector(NumInstrs, 0);
+            live_GEN_BB[&bb] = std::set<llvm::Value *>();
+            live_KILL_BB[&bb] = std::set<llvm::Value *>();
+
+            live_IN_BB[&bb] = std::set<llvm::Value *>();
+            live_OUT_BB[&bb] = std::set<llvm::Value *>();
+
             for(Instruction &inst : bb){
-                live_GEN_INST[&inst] = BitVector(NumInstrs, 0);
-                live_KILL_INST[&inst] = BitVector(NumInstrs, 0);
+                live_GEN_INST[&inst] = std::set<llvm::Value *>();
+                live_KILL_INST[&inst] = std::set<llvm::Value *>();
+
+                live_IN_INST[&inst] = std::set<llvm::Value *>();
+                live_OUT_INST[&inst] = std::set<llvm::Value *>();
             }
         }
     }
     
+        template<class T>
+    void set_union_wrap(std::set<T> & srcA, std::set<T> & srcB, std::set<T> & target){
+        std::vector<T> output_vec = std::vector<T>(srcA.size() + srcB.size());
+        typename std::vector<T>::iterator it;
 
-    void live_analysis_GENKILL(Function & F){
+        it = std::set_union(
+            srcA.begin(), srcA.end(),
+            srcB.begin(), srcB.end(),
+            output_vec.begin()
+        );
+
+        output_vec.resize(it - output_vec.begin());
+
+        target = std::set<T>(output_vec.begin(), output_vec.end());
+    }
+
+
+    template<class T>
+    void set_intersection_wrap(std::set<T> & srcA, std::set<T> & srcB, std::set<T> & target){
+        std::vector<T> output_vec = std::vector<T>(srcA.size() + srcB.size());
+        typename std::vector<T>::iterator it;
+
+        it = std::set_intersection(
+            srcA.begin(), srcA.end(),
+            srcB.begin(), srcB.end(),
+            output_vec.begin()
+        );
+
+        output_vec.resize(it - output_vec.begin());
+        
+        target = std::set<T>(output_vec.begin(), output_vec.end());
+    }
+
+    template<class T>
+    void set_diff_wrap(std::set<T> & srcA, std::set<T> & srcB, std::set<T> & target){
+        std::vector<T> output_vec = std::vector<T>(srcA.size() + srcB.size());
+        typename std::vector<T>::iterator it;
+
+        it = std::set_difference(
+            srcA.begin(), srcA.end(),
+            srcB.begin(), srcB.end(),
+            output_vec.begin()
+        );
+
+        output_vec.resize(it - output_vec.begin());
+        
+        target = std::set<T>(output_vec.begin(), output_vec.end());
+    }
+
+    void live_analysis_GENKILL_INST(Function & F){
         unsigned NumInstrs = F.getInstructionCount();
 
         unsigned i = 0;
@@ -1140,26 +1206,271 @@ struct CAT : public FunctionPass {
                 if(fptr){
                     CallInst * call_instr = cast<CallInst>(&inst);
                     if (IS_CAT_OP(fptr)){
+                        // errs() << "analyzing " << *call_instr << '\n';
                         if (IS_CAT_new(fptr)){
                             // only define but not killed
-                            live_KILL_INST[&inst].set(i);
-
+                            live_KILL_INST[&inst].insert(&inst);
+                            
                         } else if (IS_CAT_get(fptr)) {
                             // only use variable, CAT_get
-                            live_GEN_INST[&inst].set(i);
+                            Value * arg0 = call_instr->getArgOperand(0);
+                            live_GEN_INST[&inst].insert(arg0);
 
-                        } else if (IS_CAT_get(fptr)) {
+                            referenced_var.insert(arg0);
 
+                            // also define itself for printf usage
+                            // live_KILL_INST[&inst].insert(&inst);
+                        } else if (IS_CAT_set(fptr)) {
+                            // CAT_set, define and usearg0
+                            
+                            // Instruction * arg0 = cast<Instruction>(call_instr->getArgOperand(0));
+                            Value * arg0 = call_instr->getArgOperand(0);
+
+                            live_KILL_INST[&inst].insert(arg0);
+
+                            referenced_var.insert(arg0);
+                        } else {
+                            // CAT_add, CAT_sub
+                            // define arg0
+                            // use arg1, arg2
+
+                            Value * arg0 = call_instr->getArgOperand(0);
+                            Value * arg1 = call_instr->getArgOperand(1);
+                            Value * arg2 = call_instr->getArgOperand(2);
+
+                            live_KILL_INST[&inst].insert(arg0);
+                            live_GEN_INST[&inst].insert(arg1);
+                            live_GEN_INST[&inst].insert(arg2);
+
+                            referenced_var.insert(arg0);
+                            referenced_var.insert(arg1);
+                            referenced_var.insert(arg2);
+                        }   
+
+                    } else if (IN_SET(user_functions, fptr)){
+                        // Other function? 
+                        uint32_t arg_cnt = call_instr->getNumArgOperands();
+                        for(uint32_t i = 0; i < arg_cnt; i++){
+                            Value * arg = call_instr->getArgOperand(i);
+                            // if (isa<Instruction>(arg)){
+                            //     // Possibly use and define at the same time
+                            //     Instruction * arg_inst = cast<Instruction>(arg);
+
+                            //     live_KILL_INST[&inst].insert(arg_inst);
+                            //     live_GEN_INST[&inst].insert(arg_inst);
+                            // } else {
+                            //     // argument? 
+                            //     // constant??
+                            // }
+                        
+                            live_KILL_INST[&inst].insert(arg);
+                            live_GEN_INST[&inst].insert(arg);
+
+                            referenced_var.insert(arg);
                         }
-
                     } else {
+                        // non user function, eg. printf only use
+                        // uint32_t arg_cnt = call_instr->getNumArgOperands();
+                        // for(uint32_t i = 0; i < arg_cnt; i++){
+                        //     Value * arg = call_instr->getArgOperand(i);
+                        //     // if (isa<Instruction>(arg)){
+                        //     //     // Possibly use and define at the same time
+                        //     //     Instruction * arg_inst = cast<Instruction>(arg);
 
+                        //     //     live_KILL_INST[&inst].insert(arg_inst);
+                        //     //     live_GEN_INST[&inst].insert(arg_inst);
+                        //     // } else {
+                        //     //     // argument? 
+                        //     //     // constant??
+                        //     // }
+                        
+                        //     live_GEN_INST[&inst].insert(arg);
+                        // }
+                    
                     }
-
                 }
                 i++;
             }
         }
+
+        // errs() << "live_analysis_GENKILL_INST done \n";
+        // errs() << "printing reference variables\n";
+        // print_set_reference(referenced_var);
+    }
+
+    void live_analysis_GENKILL_BB(Function & F){
+        unsigned NumInstrs = F.getInstructionCount();
+
+        unsigned i = 0;
+        for (BasicBlock &bb : F){
+            for(Instruction &inst : bb){
+                set_union_wrap(
+                    live_GEN_INST[&inst],  /* src A*/
+                    live_GEN_BB[&bb],   /* src B*/
+                    live_GEN_BB[&bb]    /* target*/
+                );
+
+                set_union_wrap(
+                    live_KILL_INST[&inst],  /* src A*/
+                    live_KILL_BB[&bb],   /* src B*/
+                    live_KILL_BB[&bb]    /* target*/
+                );
+            }
+        }
+    }
+
+
+    void live_analysis_INOUT_BB(Function & F){
+        bool changed;
+        do{
+            changed = false;
+            // for(BasicBlock &bb : F){
+            for(auto it = F.getBasicBlockList().rbegin(); it != F.getBasicBlockList().rend(); it++ ){ 
+                BasicBlock * bb_ptr = &(*it);
+                for(BasicBlock * succ : successors(bb_ptr)){
+                    set_union_wrap(
+                        live_IN_BB[succ],  /* src A*/
+                        live_OUT_BB[bb_ptr],   /* src B*/
+                        live_OUT_BB[bb_ptr]    /* target*/
+                    );
+                }
+
+                std::set<Value*> IN_TEMP;
+                set_diff_wrap(
+                    live_OUT_BB[bb_ptr],  /* src A*/
+                    live_KILL_BB[bb_ptr],   /* src B*/
+                    IN_TEMP    /* target*/
+                );
+                
+                set_union_wrap(
+                    live_GEN_BB[bb_ptr],  /* src A*/
+                    IN_TEMP,   /* src B*/
+                    IN_TEMP    /* target*/
+                );
+                
+
+                if (!changed) changed = (IN_TEMP != live_IN_BB[bb_ptr]);
+                live_IN_BB[bb_ptr] = IN_TEMP;
+            }
+
+        }while(changed);
+
+    }
+
+    void live_analysis_INOUT_INST(Function & F){
+        unsigned NumInstrs = F.getInstructionCount();
+
+        for (BasicBlock &bb : F){
+            // errs() << "live GEN of BB: " << bb << '\n';
+            // print_set_reference(live_GEN_BB[&bb]);
+
+            // errs() << "live KILL of BB: " << bb << '\n';
+            // print_set_reference(live_KILL_BB[&bb]);
+
+            // errs() << "live IN of BB: " << bb << '\n';
+            // print_set_reference(live_IN_BB[&bb]);
+            
+            // errs() << "live OUT of BB: " << bb << '\n';
+            // print_set_reference(live_OUT_BB[&bb]);
+            // errs() << '\n';
+
+            std::set<Value* > local_INSTR_IN = live_OUT_BB[&bb];
+            std::set<Value* > local_INSTR_OUT = live_OUT_BB[&bb];
+            
+            // travel reversely as we have backward analysis
+
+            /*
+             * OUT[i] = IN[i + 1]
+             * IN[i] = GEN[i] U (OUT[i] - KILL[i])
+            */
+            for (auto it = bb.rbegin(); it != bb.rend(); it++){
+                Instruction * inst_ptr = &(*it);
+                local_INSTR_OUT = local_INSTR_IN;
+
+                set_diff_wrap(
+                    local_INSTR_OUT,  /* src A*/
+                    live_KILL_INST[inst_ptr],   /* src B*/
+                    local_INSTR_IN    /* target*/
+                );
+
+                set_union_wrap(
+                    local_INSTR_IN,  /* src A*/
+                    live_GEN_INST[inst_ptr],   /* src B*/
+                    local_INSTR_IN    /* target*/
+                );   
+
+                live_IN_INST[inst_ptr] = local_INSTR_IN;
+                live_OUT_INST[inst_ptr] = local_INSTR_OUT;
+
+                // errs() << "live IN of instruction: " << *inst_ptr << '\n';
+                // print_set_reference(live_IN_INST[inst_ptr]);
+
+                // errs() << "live OUT of instruction: " << *inst_ptr << "\n";
+                // print_set_reference(live_OUT_INST[inst_ptr]);
+                // errs()   << "\n";
+            }
+            
+        }
+        
+    }
+
+    void eliminating(Function & F){
+        std::vector<Instruction*> to_eliminate;
+
+        for (BasicBlock &bb : F){
+            for(Instruction &inst : bb){
+                Function * fptr = get_callee_ptr(&inst);
+                if(fptr && IS_CAT_OP(fptr)){
+                    if(IS_CAT_get(fptr)){
+
+                    } else if (IS_CAT_new(fptr)){
+                        // if (!IN_SET(referenced_var, &inst)){
+                        //     errs() << "eliminating " << inst << '\n';
+
+                        //     to_eliminate.push_back(&inst);
+                        // }
+
+                    } else {
+                        std::set<Value *> intersect;
+                        set_intersection_wrap(
+                            live_OUT_INST[&inst],         /* src A*/
+                            live_KILL_INST[&inst],   /* src B*/
+                            intersect               /* target*/
+                        );
+
+                        if(intersect.size() == 0) {
+                            errs() << "eliminating " << inst << '\n';
+
+                            to_eliminate.push_back(&inst);
+
+                        }
+                        // errs() << "live OUT of instruction: " << inst << '\n';
+                        // print_set_reference(live_OUT_INST[&inst]);
+
+                        // errs() << "live KILL of instruction: " << inst << "\n";
+                        // print_set_reference(live_KILL_INST[&inst]);
+                        // errs()   << "\n";
+                        /**
+                         * Can be eliminated if OUT[i] has no intersection with KILL[i]
+                         * */
+                    }
+                }
+            }
+        }
+
+        for (uint32_t i = 0; i < to_eliminate.size(); i++) {
+            to_eliminate[i]->eraseFromParent();
+        }
+
+    }
+
+    void live_analysis_wrapper(Function &F){
+        live_analysis_init(F);
+        live_analysis_GENKILL_INST(F);
+        live_analysis_GENKILL_BB(F);
+        live_analysis_INOUT_BB(F);
+        live_analysis_INOUT_INST(F);
+        eliminating(F);
     }
 
     void print_bitvector(BitVector &bv){
@@ -1169,6 +1480,12 @@ struct CAT : public FunctionPass {
                     errs() << " " << *instr_vec[j] << '\n';
                 }
             }
+        }
+    }
+    template<class T>
+    void print_set_reference(std::set<T> & src) {
+        for (auto & data_ptr : src ){
+            errs() << *data_ptr << '\n';
         }
     }
 };
