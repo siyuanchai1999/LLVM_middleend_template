@@ -17,7 +17,6 @@
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/IRBuilder.h"
-
 #include <set>
 #include <unordered_set>
 #include <vector>
@@ -27,6 +26,14 @@
 using namespace llvm;
  
 namespace {
+    template<class T> class Set:public std::set<T>{
+    public:
+
+};
+
+// Disjoint-Set Data Structure (Union Find Algorithm)
+
+
 struct CAT : public FunctionPass {
     static char ID; 
     Module *currentModule;
@@ -76,13 +83,137 @@ struct CAT : public FunctionPass {
     std::unordered_map<llvm::Value *, std::unordered_set<llvm::Value *>> store_table;
 #define IN_STORE_TABLE(ptr) ( store_table.find(ptr) != store_table.end() )
 
+    std::set<Value *> cat_arg;
+#define IN_CAT_ARG(ptr) (cat_arg.find(ptr)!=cat_arg.end())
+
+    std::unordered_map<Function *, std::set<Value*>> cat_var;
+
+
+    //Generic IN / OUT set
+    std::vector<Value*> sGEN;
+    std::unordered_map<Value*, std::set<Value*>> sKILL;
+    std::unordered_map<Value*, std::set<Value*>> sTemp;
+    std::unordered_map<Value*, std::set<Value*>> sBB_GEN;
+    std::unordered_map<Value*, std::set<Value*>> sBB_KILL;
+    std::unordered_map<Value *, std::set<Value*>> sBB_IN, sBB_OUT;
+    std::unordered_map<Value *, std::set<Value*>> sIN, sOUT;
+
+    void set_intersect(std::set<Value*> const &a,std::set<Value*> const &b, std::set<Value*> &ret){
+        std::set_intersection(a.begin(),a.end(),b.begin(),b.end(),std::inserter(ret,ret.begin()));
+    }
+    void set_diff(std::set<Value*> const &a,std::set<Value*> const &b, std::set<Value*> &ret){
+        std::set_difference(a.begin(),a.end(),b.begin(),b.end(),std::inserter(ret,ret.begin()));
+    }
+    void set_union(std::set<Value*> const &a,std::set<Value*> const &b, std::set<Value*> &ret){
+        ret.insert(a.begin(),a.end());
+        ret.insert(b.begin(),b.end());
+    }
+    void set_xor(std::set<Value*> const &a,std::set<Value*> const &b, std::set<Value*> &ret){
+       std::set_symmetric_difference(a.begin(),a.end(),b.begin(),b.end(),std::inserter(ret,ret.begin()));
+    }
+
+
     // deadcode elimination
     std::unordered_map<llvm::Instruction *, llvm::BitVector> live_GEN_INST, live_KILL_INST;
     std::unordered_map<llvm::Instruction *, llvm::BitVector> live_IN_INST, live_OUT_INST;
     std::unordered_map<llvm::BasicBlock *, llvm::BitVector> live_GEN_BB, live_KILL_BB;
     std::unordered_map<llvm::BasicBlock *, llvm::BitVector> live_IN_BB, live_OUT_BB;
 
-    CAT() : FunctionPass(ID) {}
+        // class to represent a disjoint set
+
+        class DisjointSet
+        {
+
+        public:
+            std::unordered_map<Value *, Value *> parent;
+            void makeSet(Function &F){
+                for(auto &BB : F){
+                    for(auto &instr: BB){
+                        if(isa<PHINode>(instr))
+                            this->parent[&instr]=&instr;
+                        if(isa<CallInst>(instr)){
+                            CallInst *call_inst = cast<CallInst>(&instr);
+                            Function *callee_ptr = call_inst->getCalledFunction();
+                            if(callee_ptr->getName().str()=="CAT_new")
+                                this->parent[&instr]=&instr;
+                        }
+
+                    }
+
+                }
+                //printSet();
+                //errs()<<"After Making set."<<"\n";
+            }
+
+            void makeSet2(Function &F){
+                for(auto &BB : F){
+                    for(auto &instr: BB){
+                        if(isa<CallInst>(instr)){
+                            CallInst *call_inst = cast<CallInst>(&instr);
+                            Function *callee_ptr = call_inst->getCalledFunction();
+                            if(callee_ptr->getName().str()=="CAT_new")
+                                this->parent[&instr]=&instr;
+                        }
+
+                    }
+
+                }
+                printSet();
+            }
+            void printSet(){
+                auto it = this->parent.begin();
+                while(it != this->parent.end()){
+                    errs()<<*(it->first)<<"<==>"<<*(it->second)<<"\n";
+                    it++;
+                }
+            }
+
+
+            // Find the root of the set in which element k belongs
+            Value* Find(Value *k)
+            {
+                // if k is root
+                if (this->parent[k] == k)
+                    return k;
+
+                // recur for parent until we find root
+                return Find(this->parent[k]);
+            }
+
+            // Perform Union of two subsets
+            void Union(Value* a, Value* b)
+            {
+                // find root of the sets in which elements
+                // x and y belongs
+                Value* x = Find(a);
+                Value* y = Find(b);
+
+                parent[x] = y;
+            }
+
+            int getConnectedSize(Value *instr){
+                int count = 0;
+                auto it = parent.begin();
+                while(it!=parent.end()){
+                    if(this->Find(it->first)==this->Find(instr))
+                        count++;
+                    it++;
+                }
+                return count;
+            }
+            int getConnectedComponent(Value* v, Set<Value *> &s){
+                int count = 0;
+                for(auto &p:parent){
+                    if(this->Find(p.first)==this->Find(v)){
+                        s.insert(p.first);
+                        count++;
+                    }
+                }
+                return count;
+            }
+        };
+
+        CAT() : FunctionPass(ID) {}
 
     // This function is invoked once at the initialization phase of the compiler
     // The LLVM IR of functions isn't ready at this point
@@ -107,26 +238,32 @@ struct CAT : public FunctionPass {
     // The LLVM IR of the input functions is ready and it can be analyzed and/or transformed
     bool runOnFunction (Function &F) override {
       // errs() << "Hello LLVM World at \"runOnFunction\"\n" ;
-        phi_node_new2set(F);
+        //findCatVariables(F);
+        //phi_node_new2set(F);
         std::string caller_name = F.getName().str();
         H0_init();
         H0_function_count(F);
         // H0_output(caller_name);
-        
-        H1_init(F);
-        H1_GEN_KILL(F);
-        // H1_output(caller_name);
+        sGEN_sKILL(F);
+        //print_gen_kill(caller_name,F);
+        sIN_sOUT(F);
+        sIN_OUT_inst(F);
+        print_in_out(caller_name, F);
 
-        H2_init(F);
-        H2_IN_OUT(F);
-        instruction_IN_OUT(F);
-        // H2_output(caller_name,F);
-
-        build_store_table(F);
-        find_escaped(F);
-
-        constant_folding(F);
-        constant_propagation(F);
+//        H1_init(F);
+//        H1_GEN_KILL(F);
+//        // H1_output(caller_name);
+//
+//        H2_init(F);
+//        H2_IN_OUT(F);
+//        instruction_IN_OUT(F);
+//        //H2_output(caller_name,F);
+//
+//        build_store_table(F);
+//        find_escaped(F);
+//
+//        constant_folding(F);
+//        constant_propagation(F);
 
         return false;
     }
@@ -137,6 +274,210 @@ struct CAT : public FunctionPass {
         // errs() << "Hello LLVM World at \"getAnalysisUsage\"\n" ;
         AU.setPreservesAll();
     }
+
+    void findCatVariables(Function &F){
+            for(auto &inst: instructions(F)){
+                if(isa<CallInst>(inst)){
+                    CallInst* callInst = cast<CallInst>(&inst);
+                    Function* callee_ptr = callInst->getCalledFunction();
+                    if(fptr2name.find(callee_ptr) != fptr2name.end()){
+                        std::string callee_name = fptr2name[callee_ptr];
+                        //CAT_set, first operand is a CAT var
+                        if(callee_name=="CAT_set"){
+                            // tail call void @CAT_set(i8* %8, i64 42) #3
+                            Value *arg = callInst->getArgOperand(0);
+                            cat_var[&F].insert(arg);
+                        }
+                        //CAT_add, CAT_sub all of their operands are CAT var
+                        if(callee_name=="CAT_add"||callee_name=="CAT_sub"){
+                            //tail call void @CAT_add(i8* %8, i8* %8, i8* %8) #3
+//                            Value* arg1 = callInst->getArgOperand(0);
+//                            Value* arg2 = callInst->getArgOperand(1);
+//                            Value* arg3 = callInst->getArgOperand(2);
+                            cat_var[&F].insert(callInst->arg_begin(),callInst->arg_end());
+                        }
+                        //CAT_new, the instruction itself is CAT var
+                        if(callee_name=="CAT_new"){
+                            cat_var[&F].insert(&inst);
+                        }
+                    }
+                }
+            }
+        }
+
+        //naive GEN KILL IN OUT
+
+    void sGEN_sKILL(Function &F){
+            for (auto& inst: llvm::instructions(F)) {
+                if (isa<CallInst>(&inst)){
+                    CallInst * call_instr = cast<CallInst>(&inst);
+                    Function * callee_ptr = call_instr->getCalledFunction();
+
+                    if (fptr2name.find(callee_ptr) != fptr2name.end()) {
+                        // find one call_instr that calls one of CAT functions
+                        std::string callee_name = fptr2name[callee_ptr];
+                        if (callee_name != "CAT_get") {
+                            sGEN.push_back(call_instr);
+
+                            Value * key;
+                            if (callee_name == "CAT_new") {
+                                key = call_instr;
+                            } else {
+                                // get first operand if CAT_set, CAT_add, CAT_sub
+                                Value * arg0 = call_instr->getArgOperand(0);
+                                key = arg0;
+                            }
+                            if(sTemp.find(key)==sTemp.end()){
+                                sTemp[key] = std::set<Value*>();
+                            }
+                            sTemp[key].insert(call_instr);
+
+                        }
+                    }
+                }
+            }
+            for(Value *gen:sGEN){
+                CallInst *call_instr = cast<CallInst>(gen);
+                Value* arg0 = call_instr->getArgOperand(0);
+                if(sTemp.find(arg0)!=sTemp.end()){
+                    sKILL[gen] = sTemp[arg0];
+                }else{
+                    sKILL[gen] = sTemp[gen];
+                }
+                sKILL[gen].erase(gen);
+            }
+    }
+    void sIN_sOUT(Function &F){
+            for(auto &bb :F){
+                sBB_IN[&bb] = std::set<Value*>();
+                sBB_OUT[&bb] = std::set<Value*>();
+                sBB_GEN[&bb] = std::set<Value*>();
+                sBB_KILL[&bb] = std::set<Value*>();
+                for(llvm::Instruction &inst :bb){
+
+                    if(std::find(sGEN.begin(),sGEN.end(),&inst)!=sGEN.end()){
+                        sBB_GEN[&bb].insert(&inst);
+                    }
+                    //TODO:Optimize
+                    std::set<Value*> temp;
+                    set_union(sBB_KILL[&bb],sKILL[&inst],temp);
+                    sBB_KILL[&bb]=temp;
+
+                    std::set<Value*> temp2;
+                    set_diff(sBB_GEN[&bb],sKILL[&inst],temp2);
+                    sBB_GEN[&bb]=temp2;
+                    if(std::find(sGEN.begin(),sGEN.end(),&inst)!=sGEN.end()){
+                        sBB_KILL[&bb].erase(&inst);
+                    }
+                }
+            }
+            bool changed;
+            do{
+                changed = false;
+                for(BasicBlock &bb : F){
+                    for(BasicBlock *Pred : predecessors(&bb)){
+                        std::set<Value*> temp3;
+                        set_union(sBB_IN[&bb],sBB_OUT[Pred],temp3);
+                        sBB_IN[&bb]=temp3;
+                    }
+                    std::set<Value*> out;
+                    std::set<Value*> temp;
+                    //  TEMP = (IN[i]-KILL[i])
+                    set_diff(sBB_IN[&bb],sBB_KILL[&bb],temp);
+                    //  OUT = GEN[i]^TEMP
+                    set_union(sBB_GEN[&bb],temp,out);
+
+                    if(!changed){
+                        changed = (out!=sBB_OUT[&bb]);
+                    }
+                    sBB_OUT[&bb] = out;
+                }
+            }while(changed);
+    }
+    void sIN_OUT_inst(Function &F){
+        for (BasicBlock &bb : F){
+            std::set<Value*> local_INSTR_IN = sBB_IN[&bb];
+            std::set<Value*> local_INSTR_OUT = sBB_IN[&bb];
+            for(Instruction &inst : bb){
+                local_INSTR_IN = local_INSTR_OUT;
+
+
+                //TODO: need to be replaced by bitwise_diff function later
+                std::set<Value*> OUT_TEMP = local_INSTR_IN;
+                std::set<Value*> INTERSECTION;
+                std::set<Value*> temp;
+                set_intersect(sKILL[&inst],local_INSTR_IN,INTERSECTION);
+                std::set<Value*> out;
+                set_xor(OUT_TEMP,INTERSECTION,temp);
+                OUT_TEMP = temp;
+
+                if(std::find(sGEN.begin(),sGEN.end(),&inst)!=sGEN.end()){
+
+                    OUT_TEMP.insert(&inst);
+                }
+                local_INSTR_OUT = OUT_TEMP;
+
+
+                sIN[&inst] = local_INSTR_IN;
+                sOUT[&inst] = local_INSTR_OUT;
+            }
+        }
+        }
+    void print_in_out(std::string &func_name, Function &F){
+        errs() << "Function \"" << func_name << "\" " << '\n';
+        unsigned inst_counter = 0;
+        for (BasicBlock &bb : F){
+            for(Instruction &inst : bb){
+                errs() << "INSTRUCTION: " << inst << '\n';
+                errs() << "***************** IN\n{\n";
+                print_set(sIN[&inst]);
+                errs() << "}\n";
+                errs() << "**************************************\n";
+                errs() << "***************** OUT\n{\n";
+
+
+                print_set(sOUT[&inst]);
+                errs() << "}\n";
+                errs() << "**************************************\n";
+                errs() << "\n\n\n";
+                inst_counter++;
+            }
+        }
+
+    }
+    void print_gen_kill(std::string &func_name, Function &F){
+        errs() << "Function \"" << func_name << "\" " << '\n';
+        for (auto& inst:instructions(F)){
+            errs() << "INSTRUCTION: " << inst << '\n';
+            errs() << "***************** GEN\n{\n";
+            if(std::find(sGEN.begin(),sGEN.end(),&inst)!=sGEN.end()){
+                errs() << " " << inst << '\n';
+            }
+            errs() << "}\n";
+
+
+            errs() << "**************************************\n";
+            errs() << "***************** KILL\n{\n";
+            for(auto& kill: sKILL[&inst]){
+                errs() << " " << *kill << '\n';
+            }
+            errs() << "}\n";
+            errs() << "**************************************\n";
+            errs() << "\n\n\n";
+        }
+        }
+    void print_set(std::set<Value*> const& p_set){
+        for(auto& i:p_set){
+            errs() << " " << *i << '\n';
+        }
+    }
+    void eliminate_multiple_definition(){
+
+    }
+    void ok(){
+
+    }
+
 
     void H0_init(){
         fptr2cnt = std::unordered_map<Function *, int>();
@@ -196,7 +537,7 @@ struct CAT : public FunctionPass {
                     if (callee_name != "CAT_get") {
                         
                         GEN.set(i);
-                    
+
                         // if (callee_name == "CAT_new") {
                         //     instr2bitmap[call_instr] = llvm::BitVector(NumInstrs, 0);
                         //     instr2bitmap[call_instr].set(i);
@@ -296,13 +637,18 @@ struct CAT : public FunctionPass {
         unsigned NumInstr = F.getInstructionCount();
         unsigned inst_counter = 0;
         //Generating GEN/KILL FOR BB
+        BasicBlock &entry = F.getEntryBlock();
+        errs()<<"ENTRY: "<<F.getName()<<"\n";
+        for(auto& i: entry){
+            errs()<<i<<"\n";
+        }
         for (llvm::BasicBlock &bb : F){
             //probably number of instr in a b
-
-            BB_GEN[&bb] = llvm::BitVector(NumInstr,0);
-            BB_KILL[&bb] = llvm::BitVector(NumInstr, 0);
             BB_IN[&bb] = BitVector(NumInstr, 0);
             BB_OUT[&bb] = BitVector(NumInstr, 0);
+            BB_GEN[&bb] = llvm::BitVector(NumInstr,0);
+            BB_KILL[&bb] = llvm::BitVector(NumInstr, 0);
+
 
             // Mapping <BasicBlock *, BitVector>
             for(llvm::Instruction &inst :bb){
@@ -413,7 +759,7 @@ struct CAT : public FunctionPass {
                 if (callee_fptr != NULL && !IS_CAT_OP(callee_fptr)) {
                     CallInst * callinstr = cast<CallInst>(&inst);
                     uint32_t arg_num = callinstr->getNumArgOperands();
-                    
+
                     for (uint32_t i = 0; i < arg_num; i++){
                         Value * arg = callinstr->getArgOperand(i);
                         std::vector<CallInst *> sub_escape;
@@ -508,6 +854,11 @@ struct CAT : public FunctionPass {
                     visited_phi[child_phi].end()
                 );
 
+            } else if(isa<Argument>(inValue)&&!isa<ConstantInt>(inValue)){
+                Argument *arg = cast<Argument>(inValue);
+                cat_arg.insert(arg);
+                visited_phi[phi].insert(arg);
+                cat_new_num++;
             }
         }
 
@@ -655,19 +1006,20 @@ struct CAT : public FunctionPass {
      * replace body with head
      * */
     void CAT_new_to_CAT_set(
-        llvm::CallInst * CAT_new_old,
-        llvm::CallInst * CAT_new_replace
+        llvm::Value * CAT_new_old,
+        llvm::Value * CAT_new_replace
     ) {
-        IRBuilder<> builder(CAT_new_old);
+        CallInst *old = cast<CallInst>(CAT_new_old);
+        IRBuilder<> builder(old);
 
-        Value * val = CAT_new_old->getArgOperand(0);
+        Value * val = old->getArgOperand(0);
         
         ArrayRef<Value *> arg_arr_ref = ArrayRef<Value *>{CAT_new_replace, val};
 
         Value * added_set_instr = builder.CreateCall(CAT_set_ptr, arg_arr_ref);
         
         // replacement
-        replace_instr_val(CAT_new_old, CAT_new_replace);
+        replace_instr_val(old, CAT_new_replace);
     }
     
 
@@ -698,23 +1050,31 @@ struct CAT : public FunctionPass {
          * */
         std::set<llvm::Value *> nodes_set(nodes.begin(), nodes.end());
 
-        CallInst * CAT_new_replace = NULL;
+        Value * CAT_new_replace = NULL;
 
         // Need fix if we add dummy block for argument???
         
         // find first instruction in the first basic block in the set of Cat_new to be merged
-        for(Instruction & inst: F.getBasicBlockList().front()){
-            if(IN_SET(nodes_set, &inst)){
-                CAT_new_replace = cast<CallInst> (&inst);
+        errs()<<"BEFORE\n";
+        for(auto arg=F.arg_begin();arg!=F.arg_end();++arg){
+            if(IN_SET(nodes_set, arg)){
+                errs()<<"FOUND"<<*arg<<"\n";
+                CAT_new_replace = cast<Value>(arg);
                 break;
             }
         }
-        
+        for(Instruction & inst: F.getBasicBlockList().front()){
+            if(IN_SET(nodes_set, &inst)){
+                CAT_new_replace = cast<Value> (&inst);
+                break;
+            }
+        }
+
         // if there's no such CAT_new, create a dummy one
         if (CAT_new_replace == NULL) CAT_new_replace = build_CAT_new_Head(F);
 
         for (uint32_t i = 0; i < nodes.size(); i++) {
-            CallInst * CAT_new_old = cast<CallInst>(nodes[i]);
+            Value * CAT_new_old = cast<Value>(nodes[i]);
 
             if (CAT_new_old != CAT_new_replace){
                 CAT_new_to_CAT_set(
@@ -724,7 +1084,7 @@ struct CAT : public FunctionPass {
             }
             
         }
-
+        errs()<<"AFTER\n";
         // for (auto it = edges.begin(); it != edges.end(); it++){
         //     PHINode * phi = cast<PHINode>(*it);
         //     replace_instr_val(phi, CAT_new_replace);
@@ -881,6 +1241,207 @@ struct CAT : public FunctionPass {
         return val;
     }
 
+//    CallInst * build_CAT_new_Head(Function & F){
+//        Instruction * first_instr = &(*instructions(F).begin());
+//        IRBuilder<> builder(first_instr);
+//
+//        Constant * zeroConst = ConstantInt::get(IntegerType::get(currentModule->getContext(), 64), 0, true);
+//        // std::vector<Value *> arg_vec{zeroConst};
+//        ArrayRef<Value *> arg_arr_ref = ArrayRef<Value *>{zeroConst};
+//
+//        Value * added_new_instr = builder.CreateCall(CAT_new_ptr, arg_arr_ref);
+//        return cast<CallInst>(added_new_instr);
+//
+//    }
+//
+//        /**
+//     *  This function is in charge of PHINode
+//     */
+//
+//    int UF_count_CAT_new(PHINode *phi){
+//        uint32_t numIncoming = phi->getNumIncomingValues();
+//        int32_t CAT_new_counter = 0;
+//
+//        // Check If all CAT_new_Instr
+//
+//        for (uint32_t i = 0; i < numIncoming; i++) {
+//            Value * inValue = phi->getIncomingValue(i);
+//            if(isa<CallInst>(inValue)){
+//                CallInst *call_instr = cast<CallInst>(inValue);
+//                Function *callee_ptr = call_instr->getCalledFunction();
+//                if(IS_CAT_new(callee_ptr))
+//                    CAT_new_counter++;
+//            }else if(isa<PHINode>(inValue)){
+//                PHINode *phi = cast<PHINode>(inValue);
+//                CAT_new_counter += UF_count_CAT_new(phi);
+//            }
+//        }
+//        return CAT_new_counter;
+//    }
+//
+//    void UF_CAT_new(DisjointSet *ds, PHINode *phi){
+//        uint32_t numIncoming = phi->getNumIncomingValues();
+//        // ALL new instruction
+//        for (uint32_t i = 0; i < numIncoming; i++) {
+//            Value * inValue = phi->getIncomingValue(i);
+//            if(isa<CallInst>(inValue)){
+//                CallInst *call_instr = cast<CallInst>(inValue);
+//                Function *callee_ptr = call_instr->getCalledFunction();
+//                if(IS_CAT_new(callee_ptr)){
+//                    Instruction *a = cast<Instruction>(call_instr);
+//                    Instruction *b = cast<Instruction>(phi);
+//                    ds->Union(a,b);
+//                }
+//            }else if(isa<PHINode>(inValue)){
+//                PHINode *next_phi = cast<PHINode>(inValue);
+//                UF_CAT_new(ds, next_phi);
+//            }
+//        }
+//    }
+//
+//
+//
+//    void eliminate_unique_definition_assumption(Function &F){
+//        DisjointSet ds;
+//        ds.makeSet(F);
+//
+//        // Analyze stage 1 - Connected graph of PHINode+CAT_new
+//        for(auto &BB: F){
+//            for(auto &instr: BB){
+//                // If this is PHI Node and both sides are CAT_new
+//                if(isa<PHINode>(instr)){
+//                    PHINode *phi = cast<PHINode>(&instr);
+//                    if(UF_count_CAT_new(phi)>=2)
+//                        UF_CAT_new(&ds,phi);
+//                }
+//            }
+//        }
+//        DisjointSet ds2;
+//        ds2.makeSet2(F);
+//
+//        // Analyze stage 2 - Connected graph of only CAT_new, record
+//        auto it = ds2.parent.begin();
+//        while(it!=ds2.parent.end()){
+//            auto it2 = ds2.parent.begin();
+//            while(it2!=ds2.parent.end()){
+//                if(ds.Find(it->first)==ds.Find(it2->first)&&it!=it2){
+//                    errs()<<"UNION:"<<*it->first<<" "<<*it2->first<<"\n";
+//                    errs()<<"UNION:"<<it->first<<" "<<it2->first<<"\n";
+//                    ds2.Union(it->first,it2->first);
+//                }
+//
+//                it2++;
+//            }
+//            it++;
+//        }
+//        errs()<<"AFTER\n";
+//        ds2.printSet();
+//        // stage 3, get connected graph
+//        std::unordered_map<Instruction *, std::set<Instruction *>> toReplace;
+//        std::vector<Instruction *> toDelete;
+//        it = ds2.parent.begin();
+//        while(it!=ds2.parent.end()){
+//            if(ds2.getConnectedSize(it->first)>=2){
+//                if(it->first!=it->second){
+//                    CallInst *cat_new1 = cast<CallInst>(it->first);
+//                    CallInst *cat_new2 = cast<CallInst>(it->second);
+//                    Value *arg1 = cat_new1->getArgOperand(0);
+//                    Value *arg2 = cat_new2->getArgOperand(0);
+//                    if(cast<ConstantInt>(arg1)->getSExtValue()==cast<ConstantInt>(arg2)->getSExtValue()){
+//                        if(toReplace.find(ds2.Find(it->first))==toReplace.end()){
+//                            toReplace[ds2.Find(it->first)]=std::set<Instruction *>();
+//                            toReplace[ds2.Find(it->first)].insert(it->first);
+//                        }else{
+//                            toReplace[ds2.Find(it->first)].insert(it->first);
+//                        }
+//                    }
+//
+//                }
+//            }
+//
+//            it++;
+//        }
+//        // get the shared predecessor of all instruction
+//        std::unordered_map<Instruction *, std::vector<BasicBlock *>> toReplacePred;
+//        auto it_toReplace = toReplace.begin();
+//        while(it_toReplace!=toReplace.end()){
+//            std::set<BasicBlock *> bb_set;
+//            bb_set.insert(it_toReplace->first->getParent());
+//            for(auto item : it_toReplace->second){
+//                bb_set.insert(item->getParent());
+//            }
+//            BasicBlock *shared_pred = get_shared_pred(&bb_set);
+//        }
+//
+//        //ds.printSet();
+//        printtoreplace(toReplace);
+//
+//
+//
+//        // Transform
+////        auto iter = toReplace.begin();
+////        while(iter!=toReplace.end()){
+////            CallInst* head = build_CAT_new_Head(F);
+////            errs()<<"HEADING:"<<(*head)<<"\n";
+////            for(auto item:iter->second){
+////                //errs()<<"ITEM:"<<(*item)<<"\n";
+////                CallInst *call_instr = cast<CallInst>(item);
+////                int64_t num = cast<ConstantInt>(call_instr->getArgOperand(0))->getSExtValue();
+////                CallInst *sub = cast<CallInst>(build_cat_set(call_instr,num));
+////                errs()<<"REPLACING:"<<(*item)<<" with "<<(*sub)<<"\n";
+////            }
+////            iter++;
+////        }
+////        errs()<<"END\n";
+//    }
+//
+//    BasicBlock *get_shared_pred(std::set<BasicBlock *> *inst_set){
+//        auto iter = inst_set->begin();
+//        while(iter!=inst_set->end()){
+//            auto bb_iter = pred_begin(*iter);
+//            // go through BB
+//            std::set<BasicBlock> inter;
+//            while(bb_iter!=pred_end(*iter)){
+//
+//            }
+//        }
+//    }
+//
+//    void replace_instr_val(Instruction * instr, Value * val){
+//        BasicBlock::iterator ii(instr);
+//        BasicBlock * bb = instr->getParent();
+//        ReplaceInstWithValue(bb->getInstList(), ii, val);
+//    }
+//        void CAT_new_to_CAT_set(
+//                llvm::CallInst * CAT_new_old,
+//                llvm::CallInst * CAT_new_replace
+//        ) {
+//            IRBuilder<> builder(CAT_new_old);
+//
+//            Value * val = CAT_new_old->getArgOperand(0);
+//
+//            ArrayRef<Value *> arg_arr_ref = ArrayRef<Value *>{CAT_new_replace, val};
+//
+//            Value * added_set_instr = builder.CreateCall(CAT_set_ptr, arg_arr_ref);
+//
+//            // replacement
+//            replace_instr_val(CAT_new_old, CAT_new_replace);
+//        }
+//
+//    void printtoreplace(std::unordered_map<Instruction *, std::set<Instruction *> > toReplace){
+//        auto it = toReplace.begin();
+//        while(it!=toReplace.end()){
+//            for(auto it2 : it->second){
+//                errs()<<"Replacing "<<it2<<" with "<<it->first<<"\n";
+//            }
+//
+//            it++;
+//        }
+//
+//    }
+
+
+
     /**
      *  check if given @instr defines a constant
      *  if so result is stored in res, and return true
@@ -926,6 +1487,7 @@ struct CAT : public FunctionPass {
         //     return false;
         // }
 
+
         // if (isa<PHINode>(arg)) {
             
         //     errs() << * call_instr <<'\n';
@@ -946,12 +1508,116 @@ struct CAT : public FunctionPass {
         //     *res = temp_val_arr[0];
         //     return true;
         // }
+//        {
+//            Function * callee_fptr = get_callee_ptr(instr);
+//            if (callee_fptr != NULL && !IS_CAT_OP(callee_fptr)) {
+//                CallInst * callinstr = cast<CallInst>(instr);
+//                uint32_t arg_num = callinstr->getNumArgOperands();
+//
+//                for (uint32_t i = 0; i < arg_num; i++){
+//                    Value * arg = callinstr->getArgOperand(i);
+//                    std::vector<CallInst *> sub_escape;
+//                    if (get_CATvar_fromArg(arg, sub_escape)) {
+//                        escaped.insert(sub_escape.begin(), sub_escape.end());
+//                    }
+//                }
+//            }
+//        }
 
 
-        if (!isa<CallInst>(arg)){
-            return false;
-            
+        if(isa<Argument>(arg)){
+            if(IN_CAT_ARG(arg)){
+
+            }else{
+                return false;
+            }
         }
+        if (isa<CallInst>(arg)){
+            errs()<<"IS A CALL!\n";
+            CallInst * init_call_instr = cast<CallInst>(arg);
+            if (IS_ESCAPED(init_call_instr)) return false;
+
+
+            // instr2bitmap[arg] is everything that defines arg
+            // if arg is a phi node, instr2bitmap[arg] contains everything after the generation of phi node
+            BitVector defs_arg = instr2bitmap[arg];
+            defs_arg &= INSTR_IN[instr];
+            /**
+             * INSTR_IN[&inst] must contain one and only one definition of arg
+             * In other word,
+             * (instr2bitmap[arg] & INSTR_IN[&inst]).count() must be one to be a constant
+             *
+             * */
+
+            // if (isa<PHINode>(arg)) {
+
+            //     errs() << * instr <<'\n';
+            //     errs() << "has argument phi: " <<'\n';
+            //     errs() << *arg << "\n";
+            //     errs() << "instr2bitmap[arg]" << "\n";
+            //     print_bitvector(instr2bitmap[arg]);
+            //     errs() << "INSTR_IN[instr]" << "\n";
+            //     print_bitvector(INSTR_IN[instr]);
+            //      errs() << "\n";
+            // }
+            if (defs_arg.count() == 0){
+                return false;
+                // if (isa<PHINode>(arg)) {
+
+                //     errs() << * instr <<'\n';
+                //     errs() << "has argument phi: " <<'\n';
+                //     errs() << *arg << "\n\n";
+                //     PHINode * phi = cast<PHINode>(arg);
+                //     uint32_t numIncoming = phi->getNumIncomingValues();
+                //     std::vector<int64_t> temp_val_arr(numIncoming);
+
+                //     for (uint32_t i = 0; i < numIncoming; i++) {
+                //         Value * inValue = phi->getIncomingValue(i);
+                //         if (!check_constant(phi, inValue, &temp_val_arr[i]) ){
+                //             return false;
+                //         }
+                //     }
+                //     if (!vec_all_equal(temp_val_arr)) return false;
+
+                //     *res = temp_val_arr[0];
+                //     return true;
+                // } else {
+                //     return false;
+                // }
+            }
+
+            // one arg could have multiple IN definition, but happen to have same value
+            // Get the all definition available for current instruction
+            unsigned idx = defs_arg.find_first();
+            bool is_const;
+            int64_t const_val;
+            std::vector<int64_t> const_vec;
+            while (idx != -1) {
+                Instruction * def_instr = instr_vec[idx];
+                is_const = check_constant_instr(def_instr, &const_val);
+
+                // one definition is not constant, return false directly
+                if (!is_const) return false;
+
+                const_vec.push_back(const_val);
+
+                idx = defs_arg.find_next(idx);
+            }
+
+            bool all_const_eq = vec_all_equal(const_vec);
+            if (!all_const_eq) return false;
+
+            *res = const_vec[0];
+
+
+
+
+
+            return true;
+        }else{
+            return false;
+        }
+        //
 
         CallInst * init_call_instr = cast<CallInst>(arg);
         if (IS_ESCAPED(init_call_instr)) return false;
@@ -1103,7 +1769,7 @@ struct CAT : public FunctionPass {
                         bool arg_const = check_constant(call_instr, arg, &arg_val);
 
                         if (arg_const) {
-                            // errs() << *call_instr << " replaced with " << arg_val <<'\n';
+                            errs() << *call_instr << " replaced with " << arg_val <<'\n';
                             toPropogate[call_instr] = build_constint(arg_val);
                         }
                     }
