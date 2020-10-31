@@ -107,6 +107,9 @@ struct CAT : public FunctionPass {
     std::map<Instruction *, std::map<Value *, Instruction *>> userCall2replace;
     std::map<Instruction *, std::pair<Instruction *, Value * >> replace2userCall;
 
+    /**
+     *  WARNING!!! 
+     * 
     void set_intersect(std::set<Value*> const &a,std::set<Value*> const &b, std::set<Value*> &ret){
         std::set_intersection(a.begin(),a.end(),b.begin(),b.end(),std::inserter(ret,ret.begin()));
     }
@@ -120,7 +123,55 @@ struct CAT : public FunctionPass {
     void set_xor(std::set<Value*> const &a,std::set<Value*> const &b, std::set<Value*> &ret){
        std::set_symmetric_difference(a.begin(),a.end(),b.begin(),b.end(),std::inserter(ret,ret.begin()));
     }
+    */
+    template<class T>
+    void set_union(std::set<T> & srcA, std::set<T> & srcB, std::set<T> & target){
+        std::vector<T> output_vec = std::vector<T>(srcA.size() + srcB.size());
+        typename std::vector<T>::iterator it;
 
+        it = std::set_union(
+            srcA.begin(), srcA.end(),
+            srcB.begin(), srcB.end(),
+            output_vec.begin()
+        );
+
+        output_vec.resize(it - output_vec.begin());
+
+        target = std::set<T>(output_vec.begin(), output_vec.end());
+    }
+
+
+    template<class T>
+    void set_intersect(std::set<T> & srcA, std::set<T> & srcB, std::set<T> & target){
+        std::vector<T> output_vec = std::vector<T>(srcA.size() + srcB.size());
+        typename std::vector<T>::iterator it;
+
+        it = std::set_intersection(
+            srcA.begin(), srcA.end(),
+            srcB.begin(), srcB.end(),
+            output_vec.begin()
+        );
+
+        output_vec.resize(it - output_vec.begin());
+        
+        target = std::set<T>(output_vec.begin(), output_vec.end());
+    }
+
+    template<class T>
+    void set_diff(std::set<T> & srcA, std::set<T> & srcB, std::set<T> & target){
+        std::vector<T> output_vec = std::vector<T>(srcA.size() + srcB.size());
+        typename std::vector<T>::iterator it;
+
+        it = std::set_difference(
+            srcA.begin(), srcA.end(),
+            srcB.begin(), srcB.end(),
+            output_vec.begin()
+        );
+
+        output_vec.resize(it - output_vec.begin());
+        
+        target = std::set<T>(output_vec.begin(), output_vec.end());
+    }
 
     // deadcode elimination
     std::unordered_map<llvm::Instruction *, llvm::BitVector> live_GEN_INST, live_KILL_INST;
@@ -552,10 +603,10 @@ struct CAT : public FunctionPass {
                 }
             }
 
-            // errs() << "Basic block GEN : " << bb << '\n';
-            // print_set_with_addr(sBB_GEN[&bb]);
-            // errs() << "Basic block KILL : " << bb << '\n';
-            // print_set_with_addr(sBB_KILL[&bb]);
+            errs() << "Basic block GEN : " << bb << '\n';
+            print_set_with_addr(sBB_GEN[&bb]);
+            errs() << "Basic block KILL : " << bb << '\n';
+            print_set_with_addr(sBB_KILL[&bb]);
         }
 
         /**
@@ -604,8 +655,9 @@ struct CAT : public FunctionPass {
         /**
          * IN[i] - KILL[i]
          * */
-        set_diff(local_INSTR_IN, sKILL[inst], local_INSTR_OUT);
-
+        std::set<Value*> temp;
+        set_diff(local_INSTR_IN, sKILL[inst], temp);
+        local_INSTR_OUT = temp;
         /**
          * OUT[i] = GEN[i] U (IN[i] - KILL[i])
          * */
@@ -622,6 +674,8 @@ struct CAT : public FunctionPass {
     void sIN_OUT_inst(Function &F){
         for (BasicBlock &bb : F){
             std::set<Value*> prev_out = sBB_IN[&bb];
+            // errs() << "Basic block IN : " << bb << '\n';
+            // print_set_with_addr(prev_out);
             for(Instruction &inst : bb){
 
                 if (IN_MAP(userCall2replace, &inst)){
@@ -630,7 +684,6 @@ struct CAT : public FunctionPass {
                      * IN[i] should just be the previous IN
                      * OUT[i] should be the last OUT produced by arguments replacement 
                      */
-                    
                     sIN[&inst] = prev_out;
                     for (auto & kv : userCall2replace[&inst]) {
                         Instruction * dummy_instr = kv.second;
@@ -694,7 +747,7 @@ struct CAT : public FunctionPass {
             errs() << "**************************************\n";
             errs() << "\n\n\n";
         }
-        }
+    }
 
     void print_set_with_addr(std::set<Value*> const& p_set){
         for(auto& i:p_set){
