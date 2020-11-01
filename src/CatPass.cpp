@@ -87,7 +87,7 @@ struct CAT : public FunctionPass {
     std::unordered_map<Function *, std::set<Value*>> cat_var;
 
     std::set<Value *> arg_set;
-
+    std::set<Value *> CAT_new_collect;
     //Generic IN / OUT set
     // std::vector<Value*> sGEN;
     std::set<Value*> sGEN;
@@ -390,8 +390,8 @@ struct CAT : public FunctionPass {
 //        find_escaped(F);
 //
         
-        constant_folding(F);
-        constant_propagation(F);
+        constant_folding(F, AA);
+        constant_propagation(F, AA);
     //    constant_propagation(F);
         return false;
     }
@@ -480,6 +480,8 @@ struct CAT : public FunctionPass {
 
         sGEN.insert(dummy);
         sVar2Def[val].insert(dummy);
+
+        
     }
 
     // LocationSize get_ptr_size(Value * ptr) {
@@ -504,6 +506,11 @@ struct CAT : public FunctionPass {
                 sGEN.insert(&arg);
 
                 sVar2Def[&arg].insert(&arg);
+
+                /**
+                 * Assume all pointers are CAT variables??
+                 * */
+                CAT_new_collect.insert(&arg);
             } 
         }
 
@@ -521,6 +528,8 @@ struct CAT : public FunctionPass {
                         Value * key;
                         if (IS_CAT_new(callee_ptr)) {
                             key = call_instr;
+
+                            CAT_new_collect.insert(call_instr);
                         } else {
                             // get first operand if CAT_set, CAT_add, CAT_sub
 
@@ -1843,13 +1852,6 @@ struct CAT : public FunctionPass {
             return false;
         }
 
-        /**
-         * If the imcoming node is a replaced dummy definition, it's not a constant, so far
-         * */
-        // if (IN_MAP( , def)) {
-        //     return false;
-        // }
-
 
         /**
          * If the imcoming node is Phi Node definition, we recursively check if each of its incoming value is constant
@@ -1871,6 +1873,17 @@ struct CAT : public FunctionPass {
                 return true;
             }
 
+            return false;
+        }  
+
+        /**
+         * If the imcoming node is a replaced dummy definition, it's not a constant, so far
+         * */
+        if(!isa<Instruction>(def)){
+            return false;
+        }
+        
+        if (IN_MAP(replace2userCall, cast<Instruction>(def))) {
             return false;
         }
         
@@ -1901,8 +1914,38 @@ struct CAT : public FunctionPass {
         return false; 
     }
 
-    bool check_constant_s(Instruction * instr, Value * arg, int64_t * res) {
 
+    bool check_constant_AA_wrap(AliasAnalysis & AA, Instruction * instr, Value * arg, int64_t * res) {
+        std::vector<Value *> aliases;
+        aliases.push_back(arg);
+        
+        for (auto & cat_var : CAT_new_collect) {
+            if (cat_var != arg){
+                AliasResult AAResult = AA.alias(cat_var, arg);
+                if (AAResult == AliasResult::MustAlias) {
+                    errs() << *arg << " at " << arg << " alias with " << *cat_var << " at " << cat_var << '\n';
+                    aliases.push_back(cat_var);
+                }
+            }
+            
+        }
+
+        /**
+         * If one alias is sure to be constant we should be good to propogate
+         * */
+        int64_t temp_val;
+        for (uint32_t i = 0; i < aliases.size(); i++) {
+            if(check_constant_s(instr, aliases[i], &temp_val)) {
+                *res = temp_val;
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    bool check_constant_s(Instruction * instr, Value * arg, int64_t * res) {
+        
         /**
          * Find the intersection between reaching definition of instr and definitions that define arg
         */
@@ -1951,7 +1994,7 @@ struct CAT : public FunctionPass {
         // errs() << "done!\n";
     }
 
-    void constant_folding(Function & F) {
+    void constant_folding(Function & F, AliasAnalysis & AA) {
         // errs() << "Folding on " << F.getName().str() << '\n';
         unsigned inst_counter = 0;
         std::unordered_map<llvm::CallInst *, Value *> toFold;
@@ -1971,8 +2014,11 @@ struct CAT : public FunctionPass {
                         Value * arg2 = call_instr->getArgOperand(2);
                         
                         int64_t arg1_val = 0, arg2_val = 0;
-                        bool arg1_const = check_constant_s(call_instr, arg1, &arg1_val);
-                        bool arg2_const = check_constant_s(call_instr, arg2, &arg2_val);
+                        // bool arg1_const = check_constant_s(call_instr, arg1, &arg1_val);
+                        // bool arg2_const = check_constant_s(call_instr, arg2, &arg2_val);
+                        
+                        bool arg1_const = check_constant_AA_wrap(AA, call_instr, arg1, &arg1_val);
+                        bool arg2_const = check_constant_AA_wrap(AA, call_instr, arg2, &arg2_val);
 
                         int64_t substitution = (IS_CAT_add(callee_ptr) ? arg1_val + arg2_val : arg1_val - arg2_val);
                         
@@ -1994,7 +2040,7 @@ struct CAT : public FunctionPass {
         replace_from_map(toFold);
     }
 
-    void constant_propagation(Function & F) {
+    void constant_propagation(Function & F, AliasAnalysis & AA) {
         // errs() << "Propogate on " << F.getName().str() << '\n';
         unsigned inst_counter = 0;
         std::unordered_map<llvm::CallInst *, Value *> toPropogate;
@@ -2007,8 +2053,9 @@ struct CAT : public FunctionPass {
                     if(IS_CAT_get(callee_ptr)) {
                         Value * arg = call_instr->getArgOperand(0);
                         int64_t arg_val; 
-                        bool arg_const = check_constant_s(call_instr, arg, &arg_val);
+                        // bool arg_const = check_constant_s(call_instr, arg, &arg_val);
 
+                        bool arg_const = check_constant_AA_wrap(AA, call_instr, arg, &arg_val);
                         if (arg_const) {
                             // errs() << *call_instr << " replaced with " << arg_val <<'\n';
                             toPropogate[call_instr] = build_constint(arg_val);
