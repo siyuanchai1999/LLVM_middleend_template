@@ -39,7 +39,6 @@ struct CAT : public FunctionPass {
     Module *currentModule;
     std::unordered_set<Function *> user_func;
 #define IS_USER_FUNC(fptr) (IN_SET(user_func, fptr))
-    
     std::set<std::string> func_set = {
         "CAT_new",
         "CAT_add",
@@ -125,6 +124,60 @@ struct CAT : public FunctionPass {
        std::set_symmetric_difference(a.begin(),a.end(),b.begin(),b.end(),std::inserter(ret,ret.begin()));
     }
     */
+
+#define HAS_MOD(info) (\
+        info == ModRefInfo::MustMod \
+    || info == ModRefInfo::MustModRef \
+    || info == ModRefInfo::Mod \
+    || info == ModRefInfo::ModRef \
+)
+
+#define NO_MOD(info) (!HAS_MOD(info))
+
+    std::string ModRefInfo_toString(ModRefInfo info){
+        std::string str;
+        switch (info)
+        {
+        case ModRefInfo::Must :
+            str = "ModRefInfo::Must";
+            break;
+
+        case ModRefInfo::MustRef :
+            str = "ModRefInfo::MustRef";
+            break;
+        
+        case ModRefInfo::MustMod :
+            str = "ModRefInfo::MustMod";
+            break;
+
+        case ModRefInfo::MustModRef :
+            str = "ModRefInfo::MustModRef";
+            break;
+
+        case ModRefInfo::NoModRef :
+            str = "ModRefInfo::NoModRef";
+            break;
+
+        case ModRefInfo::Ref :
+            str = "ModRefInfo::Ref";
+            break;
+
+        case ModRefInfo::Mod :
+            str = "ModRefInfo::Mod";
+            break;
+
+        case ModRefInfo::ModRef :
+            str = "ModRefInfo::ModRef";
+            break;
+
+        default:
+            str = "";
+            break;
+        }
+
+        return str;
+    }
+
     template<class T>
     void set_union(std::set<T> & srcA, std::set<T> & srcB, std::set<T> & target){
         std::vector<T> output_vec = std::vector<T>(srcA.size() + srcB.size());
@@ -322,7 +375,7 @@ struct CAT : public FunctionPass {
         //print_gen_kill(caller_name,F);
         sIN_sOUT(F);
         sIN_OUT_inst(F);
-        print_in_out(F);
+        // print_in_out(F);
 
 //        H1_init(F);
 //        H1_GEN_KILL(F);
@@ -429,7 +482,15 @@ struct CAT : public FunctionPass {
         sVar2Def[val].insert(dummy);
     }
 
-
+    // LocationSize get_ptr_size(Value * ptr) {
+    //     if (isa<PointerType>(ptr->getType())) {
+    //         auto pointedElementType = cast<PointerType>(ptr)->getElementType();
+    //         if(pointedElementType->isSized()){
+    //             auto size = currentModule->getDataLayout().getTypeStoreSize(pointedElementType);
+    //             return LocationSize(size);
+    //         }
+    //     }
+    // }
     void sGEN_sKILL(Function &F, AliasAnalysis & AA){
         /**
          *  Handling GEN KILL for Function argument
@@ -462,6 +523,7 @@ struct CAT : public FunctionPass {
                             key = call_instr;
                         } else {
                             // get first operand if CAT_set, CAT_add, CAT_sub
+
                             Value * arg0 = call_instr->getArgOperand(0);
                             key = arg0;
                         }
@@ -483,11 +545,38 @@ struct CAT : public FunctionPass {
                          *  The relation is recorded in the map callInst -> set of dummy instructions
                          * */
                         if (isa<PointerType>(arg->getType())) {
-                            errs() << *call_instr << " has arg " << *arg << " at " << arg << '\n';
+                            std::vector<Value *> possible_vals;
+                            ptr_trace_back(arg, possible_vals);
 
-                            dummy_def_val(arg, call_instr);
+                            for (uint32_t j = 0; j < possible_vals.size(); j++) {
+                                // if(isa<Instruction>(possible_vals[j])){
+                                    // Instruction * memInst = cast<Instruction>(possible_vals[j]);
+                                    
+                                    // errs() << *memInst  << " at " << memInst << '\n'; 
+                                    MemoryLocation memLoc(possible_vals[j]);
+                                    ModRefInfo info = AA.getModRefInfo(call_instr, memLoc); 
+
+
+                                    errs() << *call_instr << " has arg " << *arg << " at " << arg << " ModRefInfo = " << ModRefInfo_toString(info) <<'\n';
+                                    if (HAS_MOD(info)){
+                                        
+                                        dummy_def_val(possible_vals[j], call_instr);
+                                    }
+                                // }
+                                // errs() << *call_instr << " has arg " << *arg << " at " << arg << '\n';
+                                // dummy_def_val(possible_vals[j], call_instr);
+                            }
+
                             
                         }                
+                    }
+                    
+                    /**
+                     * If call instruction itself returns a pointer
+                     * */
+                    if (isa<PointerType>(call_instr->getType())) {
+                        sGEN.insert(call_instr);
+                        sVar2Def[call_instr].insert(call_instr);
                     }
                 }
 
@@ -534,6 +623,8 @@ struct CAT : public FunctionPass {
                         sKILL[gen] =  sVar2Def[key];
                     }
 
+                } else if (IS_USER_FUNC(callee_ptr)) {
+                    sKILL[gen] =  sVar2Def[call_instr];
                 }
 
             } else if (isa<PHINode>(gen)) {
@@ -587,6 +678,7 @@ struct CAT : public FunctionPass {
             for(llvm::Instruction &inst :bb){
 
                 if (IN_MAP(userCall2replace, &inst)){
+                    calc_BB_GEN_KILL(&inst, &bb);
                     for (auto & kv : userCall2replace[&inst]) {
                         Instruction * dummy_instr = kv.second;
                         calc_BB_GEN_KILL(dummy_instr, &bb);
@@ -677,6 +769,7 @@ struct CAT : public FunctionPass {
                      * IN[i] should just be the previous IN
                      * OUT[i] should be the last OUT produced by arguments replacement 
                      */
+                    __INSTR_INOUT(prev_out, &inst);
                     sIN[&inst] = prev_out;
                     for (auto & kv : userCall2replace[&inst]) {
                         Instruction * dummy_instr = kv.second;
@@ -1019,6 +1112,17 @@ struct CAT : public FunctionPass {
                 inst_counter++;
             }
         }
+    }
+
+    void ptr_trace_back(Value * ptr, std::vector<Value *> & possible_val){
+        if (IN_STORE_TABLE(ptr)) {
+            for (auto & val : store_table[ptr]) {
+                ptr_trace_back(val, possible_val);
+            }
+        } else {
+            possible_val.push_back(ptr);
+        }
+        
     }
 
     void build_store_table(Function & F) {
