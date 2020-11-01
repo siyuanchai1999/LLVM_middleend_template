@@ -17,6 +17,7 @@
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/IRBuilder.h"
+#include "llvm/Analysis/AliasAnalysis.h"
 #include <set>
 #include <unordered_set>
 #include <vector>
@@ -306,20 +307,22 @@ struct CAT : public FunctionPass {
     // This function is invoked once per function compiled
     // The LLVM IR of the input functions is ready and it can be analyzed and/or transformed
     bool runOnFunction (Function &F) override {
-      // errs() << "Hello LLVM World at \"runOnFunction\"\n" ;
         //findCatVariables(F);
         //phi_node_new2set(F);
-        std::string caller_name = F.getName().str();
+        AliasAnalysis & AA = getAnalysis<AAResultsWrapperPass>().getAAResults();
+
+        build_store_table(F);
+
         H0_init();
         H0_function_count(F);
         // H0_output(caller_name);
 
         sGEN_sKILL_init();
-        sGEN_sKILL(F);
+        sGEN_sKILL(F, AA);
         //print_gen_kill(caller_name,F);
         sIN_sOUT(F);
         sIN_OUT_inst(F);
-        // print_in_out(caller_name, F);
+        print_in_out(F);
 
 //        H1_init(F);
 //        H1_GEN_KILL(F);
@@ -330,7 +333,7 @@ struct CAT : public FunctionPass {
 //        instruction_IN_OUT(F);
 //        //H2_output(caller_name,F);
 //
-//        build_store_table(F);
+//        
 //        find_escaped(F);
 //
         
@@ -344,7 +347,9 @@ struct CAT : public FunctionPass {
     // The LLVM IR of functions isn't ready at this point
     void getAnalysisUsage(AnalysisUsage &AU) const override {
         // errs() << "Hello LLVM World at \"getAnalysisUsage\"\n" ;
-        AU.setPreservesAll();
+
+        // AU.setPreservesAll();
+        AU.addRequired<AAResultsWrapperPass>();
     }
 
     void findCatVariables(Function &F){
@@ -403,7 +408,7 @@ struct CAT : public FunctionPass {
     /**
      *  Expect arg to be a pointer 
      * */
-    Instruction * dummy_instr_arg(Value * arg) {
+    Instruction * dummy_instr_create() {
         Constant *zeroConst = ConstantInt::get(
                                     IntegerType::get(currentModule->getContext(), 32), 
                                     0, 
@@ -414,7 +419,18 @@ struct CAT : public FunctionPass {
         return newInst;
     }
 
-    void sGEN_sKILL(Function &F){
+    void dummy_def_val(Value * val, CallInst * call_instr){
+        Instruction * dummy = dummy_instr_create();
+
+        userCall2replace[call_instr][val] = dummy;
+        replace2userCall[dummy] = std::make_pair(call_instr, val);
+
+        sGEN.insert(dummy);
+        sVar2Def[val].insert(dummy);
+    }
+
+
+    void sGEN_sKILL(Function &F, AliasAnalysis & AA){
         /**
          *  Handling GEN KILL for Function argument
          * */
@@ -429,6 +445,7 @@ struct CAT : public FunctionPass {
                 sVar2Def[&arg].insert(&arg);
             } 
         }
+
 
         for (auto& inst: llvm::instructions(F)) {
             if (isa<CallInst>(&inst)){
@@ -467,16 +484,9 @@ struct CAT : public FunctionPass {
                          * */
                         if (isa<PointerType>(arg->getType())) {
                             errs() << *call_instr << " has arg " << *arg << " at " << arg << '\n';
-                            Instruction * dummy = dummy_instr_arg(arg);
 
-                            userCall2replace[call_instr][arg] = dummy;
-                            replace2userCall[dummy] = std::make_pair(call_instr, arg);
-
-                            /**
-                             * TODO: Fix with pointer aliasing
-                             * */
-                            sGEN.insert(dummy);
-                            sVar2Def[arg].insert(dummy);
+                            dummy_def_val(arg, call_instr);
+                            
                         }                
                     }
                 }
@@ -576,23 +586,6 @@ struct CAT : public FunctionPass {
 
             for(llvm::Instruction &inst :bb){
 
-                // // if(std::find(sGEN.begin(),sGEN.end(),&inst)!=sGEN.end()){
-                // if(IN_SET(sGEN, &inst)){
-                //     sBB_GEN[&bb].insert(&inst);
-                // }
-                // //TODO:Optimize
-                // std::set<Value*> temp;
-                // set_union(sBB_KILL[&bb],sKILL[&inst],temp);
-                // sBB_KILL[&bb]=temp;
-
-                // std::set<Value*> temp2;
-                // set_diff(sBB_GEN[&bb],sKILL[&inst],temp2);
-                // sBB_GEN[&bb]=temp2;
-                
-                // // if(std::find(sGEN.begin(),sGEN.end(),&inst)!=sGEN.end()){
-                // if(IN_SET(sGEN, &inst)){
-                //     sBB_KILL[&bb].erase(&inst);
-                // }
                 if (IN_MAP(userCall2replace, &inst)){
                     for (auto & kv : userCall2replace[&inst]) {
                         Instruction * dummy_instr = kv.second;
@@ -603,10 +596,10 @@ struct CAT : public FunctionPass {
                 }
             }
 
-            errs() << "Basic block GEN : " << bb << '\n';
-            print_set_with_addr(sBB_GEN[&bb]);
-            errs() << "Basic block KILL : " << bb << '\n';
-            print_set_with_addr(sBB_KILL[&bb]);
+            // errs() << "Basic block GEN : " << bb << '\n';
+            // print_set_with_addr(sBB_GEN[&bb]);
+            // errs() << "Basic block KILL : " << bb << '\n';
+            // print_set_with_addr(sBB_KILL[&bb]);
         }
 
         /**
@@ -702,8 +695,8 @@ struct CAT : public FunctionPass {
         }
     }
     
-    void print_in_out(std::string &func_name, Function &F){
-        errs() << "Function \"" << func_name << "\" " << '\n';
+    void print_in_out(Function &F){
+        errs() << "Function \"" << F.getName() << "\" " << '\n';
         unsigned inst_counter = 0;
         for (BasicBlock &bb : F){
             for(Instruction &inst : bb){
@@ -1029,6 +1022,8 @@ struct CAT : public FunctionPass {
     }
 
     void build_store_table(Function & F) {
+        store_table.clear();
+
         for (BasicBlock &bb : F){
             for(Instruction &inst : bb){
                 if (isa<StoreInst>(&inst)){
@@ -1744,6 +1739,13 @@ struct CAT : public FunctionPass {
             return false;
         }
 
+        /**
+         * If the imcoming node is a replaced dummy definition, it's not a constant, so far
+         * */
+        // if (IN_MAP( , def)) {
+        //     return false;
+        // }
+
 
         /**
          * If the imcoming node is Phi Node definition, we recursively check if each of its incoming value is constant
@@ -1794,207 +1796,6 @@ struct CAT : public FunctionPass {
         }
         return false; 
     }
-    // Check if arg of call_instr can be simpliefed with constant propogation
-    
-    // Check if arg under in IN/OUT secenario of instr is constant
-
-    // if so, return true, and store constant value into res
-    // if not, return false, nothing should be changed to res
-//     bool check_constant(Instruction * instr, Value * arg, int64_t * res){
-//         // if (isa<Argument>(arg)) {
-//         //     return false;
-//         // }
-
-
-//         // if (isa<PHINode>(arg)) {
-            
-//         //     errs() << * call_instr <<'\n';
-//         //     errs() << "has argument phi: " <<'\n';
-//         //     errs() << *arg << "\n\n";
-//         //     PHINode * phi = cast<PHINode>(arg);
-//         //     uint32_t numIncoming = phi->getNumIncomingValues();
-//         //     std::vector<int64_t> temp_val_arr(numIncoming);
-
-//         //     for (uint32_t i = 0; i < numIncoming; i++) {
-//         //         Value * inValue = phi->getIncomingValue(i);
-//         //         if (!check_constant(call_instr, inValue, &temp_val_arr[i]) ){
-//         //             return false;
-//         //         }
-//         //     }
-//         //     if (!vec_all_equal(temp_val_arr)) return false;
-
-//         //     *res = temp_val_arr[0];
-//         //     return true;
-//         // }
-// //        {
-// //            Function * callee_fptr = get_callee_ptr(instr);
-// //            if (callee_fptr != NULL && !IS_CAT_OP(callee_fptr)) {
-// //                CallInst * callinstr = cast<CallInst>(instr);
-// //                uint32_t arg_num = callinstr->getNumArgOperands();
-// //
-// //                for (uint32_t i = 0; i < arg_num; i++){
-// //                    Value * arg = callinstr->getArgOperand(i);
-// //                    std::vector<CallInst *> sub_escape;
-// //                    if (get_CATvar_fromArg(arg, sub_escape)) {
-// //                        escaped.insert(sub_escape.begin(), sub_escape.end());
-// //                    }
-// //                }
-// //            }
-// //        }
-
-
-//         if(isa<Argument>(arg)){
-//             if(IN_CAT_ARG(arg)){
-
-//             }else{
-//                 return false;
-//             }
-//         }
-//         if (isa<CallInst>(arg)){
-//             errs()<<"IS A CALL!\n";
-//             CallInst * init_call_instr = cast<CallInst>(arg);
-//             if (IS_ESCAPED(init_call_instr)) return false;
-
-
-//             // instr2bitmap[arg] is everything that defines arg
-//             // if arg is a phi node, instr2bitmap[arg] contains everything after the generation of phi node
-//             BitVector defs_arg = instr2bitmap[arg];
-//             defs_arg &= INSTR_IN[instr];
-//             /**
-//              * INSTR_IN[&inst] must contain one and only one definition of arg
-//              * In other word,
-//              * (instr2bitmap[arg] & INSTR_IN[&inst]).count() must be one to be a constant
-//              *
-//              * */
-
-//             // if (isa<PHINode>(arg)) {
-
-//             //     errs() << * instr <<'\n';
-//             //     errs() << "has argument phi: " <<'\n';
-//             //     errs() << *arg << "\n";
-//             //     errs() << "instr2bitmap[arg]" << "\n";
-//             //     print_bitvector(instr2bitmap[arg]);
-//             //     errs() << "INSTR_IN[instr]" << "\n";
-//             //     print_bitvector(INSTR_IN[instr]);
-//             //      errs() << "\n";
-//             // }
-//             if (defs_arg.count() == 0){
-//                 return false;
-//                 // if (isa<PHINode>(arg)) {
-
-//                 //     errs() << * instr <<'\n';
-//                 //     errs() << "has argument phi: " <<'\n';
-//                 //     errs() << *arg << "\n\n";
-//                 //     PHINode * phi = cast<PHINode>(arg);
-//                 //     uint32_t numIncoming = phi->getNumIncomingValues();
-//                 //     std::vector<int64_t> temp_val_arr(numIncoming);
-
-//                 //     for (uint32_t i = 0; i < numIncoming; i++) {
-//                 //         Value * inValue = phi->getIncomingValue(i);
-//                 //         if (!check_constant(phi, inValue, &temp_val_arr[i]) ){
-//                 //             return false;
-//                 //         }
-//                 //     }
-//                 //     if (!vec_all_equal(temp_val_arr)) return false;
-
-//                 //     *res = temp_val_arr[0];
-//                 //     return true;
-//                 // } else {
-//                 //     return false;
-//                 // }
-//             }
-
-//             // one arg could have multiple IN definition, but happen to have same value
-//             // Get the all definition available for current instruction
-//             unsigned idx = defs_arg.find_first();
-//             bool is_const;
-//             int64_t const_val;
-//             std::vector<int64_t> const_vec;
-//             while (idx != -1) {
-//                 Instruction * def_instr = instr_vec[idx];
-//                 is_const = check_constant_instr(def_instr, &const_val);
-
-//                 // one definition is not constant, return false directly
-//                 if (!is_const) return false;
-
-//                 const_vec.push_back(const_val);
-
-//                 idx = defs_arg.find_next(idx);
-//             }
-
-//             bool all_const_eq = vec_all_equal(const_vec);
-//             if (!all_const_eq) return false;
-
-//             *res = const_vec[0];
-
-
-
-
-
-//             return true;
-//         }else{
-//             return false;
-//         }
-//         //
-
-//         CallInst * init_call_instr = cast<CallInst>(arg);
-//         if (IS_ESCAPED(init_call_instr)) return false;
-
-
-//         // instr2bitmap[arg] is everything that defines arg
-//         // if arg is a phi node, instr2bitmap[arg] contains everything after the generation of phi node
-        
-        
-//         BitVector defs_arg = instr2bitmap[arg];
-//         defs_arg &= INSTR_IN[instr];
-//         /**
-//          * INSTR_IN[&inst] must contain one and only one definition of arg
-//          * In other word,
-//          * (instr2bitmap[arg] & INSTR_IN[&inst]).count() must be one to be a constant 
-//          * 
-//          * */
-        
-//         // if (isa<PHINode>(arg)) {
-            
-//         //     errs() << * instr <<'\n';
-//         //     errs() << "has argument phi: " <<'\n';
-//         //     errs() << *arg << "\n";
-//         //     errs() << "instr2bitmap[arg]" << "\n";
-//         //     print_bitvector(instr2bitmap[arg]);
-//         //     errs() << "INSTR_IN[instr]" << "\n";
-//         //     print_bitvector(INSTR_IN[instr]);
-//         //      errs() << "\n";
-//         // }
-//         if (defs_arg.count() == 0){
-//             return false;
-//         }
-
-//         // one arg could have multiple IN definition, but happen to have same value
-//         // Get the all definition available for current instruction
-//         unsigned idx = defs_arg.find_first();
-//         bool is_const;
-//         int64_t const_val;
-//         std::vector<int64_t> const_vec;
-//         while (idx != -1) {
-//             Instruction * def_instr = instr_vec[idx];
-//             is_const = check_constant_instr(def_instr, &const_val);
-
-//             // one definition is not constant, return false directly
-//             if (!is_const) return false;
-
-//             const_vec.push_back(const_val);
-
-//             idx = defs_arg.find_next(idx);
-//         }
-        
-//         bool all_const_eq = vec_all_equal(const_vec);
-//         if (!all_const_eq) return false;
-
-//         *res = const_vec[0];
-//         return true;
-        
-//     }
-
 
     bool check_constant_s(Instruction * instr, Value * arg, int64_t * res) {
 
@@ -2087,14 +1888,6 @@ struct CAT : public FunctionPass {
             toFold[kv.first] = build_cat_set(kv.first, kv.second);
         }
         replace_from_map(toFold);
-        // for (BasicBlock &bb : F){
-        //     for(Instruction &inst : bb){
-        //         errs() << inst << '\n';   
-        //     }
-        //     errs() << '\n';
-        // }
-
-        // errs() << "Done: constant folding!\n";
     }
 
     void constant_propagation(Function & F) {
