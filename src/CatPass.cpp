@@ -1915,6 +1915,12 @@ struct CAT : public FunctionPass {
     }
 
 
+    /**
+     *  Wrapper with AliasAnalysis.
+     *  If we arg MUST Alias with some CAT_var, we are same to claim it's constant
+     *          as long as one of them is constant in terms of reaching definition of instr
+     * */
+
     bool check_constant_AA_wrap(AliasAnalysis & AA, Instruction * instr, Value * arg, int64_t * res) {
         std::vector<Value *> aliases;
         aliases.push_back(arg);
