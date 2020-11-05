@@ -552,6 +552,7 @@ struct CAT : public FunctionPass {
                          *  for each ptr argument of user function f we generate a dummy instruction
                          *          we assume that instruction defines arg and alias of arg
                          *  The relation is recorded in the map callInst -> set of dummy instructions
+                         *  
                          * */
                         if (isa<PointerType>(arg->getType())) {
                             std::vector<Value *> possible_vals;
