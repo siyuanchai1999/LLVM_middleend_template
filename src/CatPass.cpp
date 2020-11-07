@@ -233,99 +233,6 @@ struct CAT : public FunctionPass {
     std::unordered_map<llvm::BasicBlock *, llvm::BitVector> live_GEN_BB, live_KILL_BB;
     std::unordered_map<llvm::BasicBlock *, llvm::BitVector> live_IN_BB, live_OUT_BB;
         // class to represent a disjoint set
-/*
-        class DisjointSet
-        {
-
-        public:
-            std::unordered_map<Value *, Value *> parent;
-            void makeSet(Function &F){
-                for(auto &BB : F){
-                    for(auto &instr: BB){
-                        if(isa<PHINode>(instr))
-                            this->parent[&instr]=&instr;
-                        if(isa<CallInst>(instr)){
-                            CallInst *call_inst = cast<CallInst>(&instr);
-                            Function *callee_ptr = call_inst->getCalledFunction();
-                            if(callee_ptr->getName().str()=="CAT_new")
-                                this->parent[&instr]=&instr;
-                        }
-
-                    }
-
-                }
-                //printSet();
-                //errs()<<"After Making set."<<"\n";
-            }
-
-            void makeSet2(Function &F){
-                for(auto &BB : F){
-                    for(auto &instr: BB){
-                        if(isa<CallInst>(instr)){
-                            CallInst *call_inst = cast<CallInst>(&instr);
-                            Function *callee_ptr = call_inst->getCalledFunction();
-                            if(callee_ptr->getName().str()=="CAT_new")
-                                this->parent[&instr]=&instr;
-                        }
-
-                    }
-
-                }
-                printSet();
-            }
-            void printSet(){
-                auto it = this->parent.begin();
-                while(it != this->parent.end()){
-                    errs()<<*(it->first)<<"<==>"<<*(it->second)<<"\n";
-                    it++;
-                }
-            }
-
-
-            // Find the root of the set in which element k belongs
-            Value* Find(Value *k)
-            {
-                // if k is root
-                if (this->parent[k] == k)
-                    return k;
-
-                // recur for parent until we find root
-                return Find(this->parent[k]);
-            }
-
-            // Perform Union of two subsets
-            void Union(Value* a, Value* b)
-            {
-                // find root of the sets in which elements
-                // x and y belongs
-                Value* x = Find(a);
-                Value* y = Find(b);
-
-                parent[x] = y;
-            }
-
-            int getConnectedSize(Value *instr){
-                int count = 0;
-                auto it = parent.begin();
-                while(it!=parent.end()){
-                    if(this->Find(it->first)==this->Find(instr))
-                        count++;
-                    it++;
-                }
-                return count;
-            }
-            int getConnectedComponent(Value* v, Set<Value *> &s){
-                int count = 0;
-                for(auto &p:parent){
-                    if(this->Find(p.first)==this->Find(v)){
-                        s.insert(p.first);
-                        count++;
-                    }
-                }
-                return count;
-            }
-        };
-*/
         CAT() : FunctionPass(ID) {}
 
     // This function is invoked once at the initialization phase of the compiler
@@ -391,6 +298,12 @@ struct CAT : public FunctionPass {
 //
         
         constant_folding(F, AA);
+
+
+        sGEN_sKILL_init();
+        sGEN_sKILL(F, AA);
+        sIN_sOUT(F);
+        sIN_OUT_inst(F);
         constant_propagation(F, AA);
     //    constant_propagation(F);
         return false;
@@ -484,15 +397,6 @@ struct CAT : public FunctionPass {
         
     }
 
-    // LocationSize get_ptr_size(Value * ptr) {
-    //     if (isa<PointerType>(ptr->getType())) {
-    //         auto pointedElementType = cast<PointerType>(ptr)->getElementType();
-    //         if(pointedElementType->isSized()){
-    //             auto size = currentModule->getDataLayout().getTypeStoreSize(pointedElementType);
-    //             return LocationSize(size);
-    //         }
-    //     }
-    // }
     void sGEN_sKILL(Function &F, AliasAnalysis & AA){
         /**
          *  Handling GEN KILL for Function argument
@@ -572,12 +476,7 @@ struct CAT : public FunctionPass {
                                         
                                         dummy_def_val(possible_vals[j], call_instr);
                                     }
-                                // }
-                                // errs() << *call_instr << " has arg " << *arg << " at " << arg << '\n';
-                                // dummy_def_val(possible_vals[j], call_instr);
                             }
-
-                            
                         }                
                     }
                     
@@ -1638,206 +1537,6 @@ struct CAT : public FunctionPass {
         Value * val = ConstantInt::get(llvm_int64, num, true);
         return val;
     }
-
-
-//    CallInst * build_CAT_new_Head(Function & F){
-//        Instruction * first_instr = &(*instructions(F).begin());
-//        IRBuilder<> builder(first_instr);
-//
-//        Constant * zeroConst = ConstantInt::get(IntegerType::get(currentModule->getContext(), 64), 0, true);
-//        // std::vector<Value *> arg_vec{zeroConst};
-//        ArrayRef<Value *> arg_arr_ref = ArrayRef<Value *>{zeroConst};
-//
-//        Value * added_new_instr = builder.CreateCall(CAT_new_ptr, arg_arr_ref);
-//        return cast<CallInst>(added_new_instr);
-//
-//    }
-//
-//        /**
-//     *  This function is in charge of PHINode
-//     */
-//
-//    int UF_count_CAT_new(PHINode *phi){
-//        uint32_t numIncoming = phi->getNumIncomingValues();
-//        int32_t CAT_new_counter = 0;
-//
-//        // Check If all CAT_new_Instr
-//
-//        for (uint32_t i = 0; i < numIncoming; i++) {
-//            Value * inValue = phi->getIncomingValue(i);
-//            if(isa<CallInst>(inValue)){
-//                CallInst *call_instr = cast<CallInst>(inValue);
-//                Function *callee_ptr = call_instr->getCalledFunction();
-//                if(IS_CAT_new(callee_ptr))
-//                    CAT_new_counter++;
-//            }else if(isa<PHINode>(inValue)){
-//                PHINode *phi = cast<PHINode>(inValue);
-//                CAT_new_counter += UF_count_CAT_new(phi);
-//            }
-//        }
-//        return CAT_new_counter;
-//    }
-//
-//    void UF_CAT_new(DisjointSet *ds, PHINode *phi){
-//        uint32_t numIncoming = phi->getNumIncomingValues();
-//        // ALL new instruction
-//        for (uint32_t i = 0; i < numIncoming; i++) {
-//            Value * inValue = phi->getIncomingValue(i);
-//            if(isa<CallInst>(inValue)){
-//                CallInst *call_instr = cast<CallInst>(inValue);
-//                Function *callee_ptr = call_instr->getCalledFunction();
-//                if(IS_CAT_new(callee_ptr)){
-//                    Instruction *a = cast<Instruction>(call_instr);
-//                    Instruction *b = cast<Instruction>(phi);
-//                    ds->Union(a,b);
-//                }
-//            }else if(isa<PHINode>(inValue)){
-//                PHINode *next_phi = cast<PHINode>(inValue);
-//                UF_CAT_new(ds, next_phi);
-//            }
-//        }
-//    }
-//
-//
-//
-//    void eliminate_unique_definition_assumption(Function &F){
-//        DisjointSet ds;
-//        ds.makeSet(F);
-//
-//        // Analyze stage 1 - Connected graph of PHINode+CAT_new
-//        for(auto &BB: F){
-//            for(auto &instr: BB){
-//                // If this is PHI Node and both sides are CAT_new
-//                if(isa<PHINode>(instr)){
-//                    PHINode *phi = cast<PHINode>(&instr);
-//                    if(UF_count_CAT_new(phi)>=2)
-//                        UF_CAT_new(&ds,phi);
-//                }
-//            }
-//        }
-//        DisjointSet ds2;
-//        ds2.makeSet2(F);
-//
-//        // Analyze stage 2 - Connected graph of only CAT_new, record
-//        auto it = ds2.parent.begin();
-//        while(it!=ds2.parent.end()){
-//            auto it2 = ds2.parent.begin();
-//            while(it2!=ds2.parent.end()){
-//                if(ds.Find(it->first)==ds.Find(it2->first)&&it!=it2){
-//                    errs()<<"UNION:"<<*it->first<<" "<<*it2->first<<"\n";
-//                    errs()<<"UNION:"<<it->first<<" "<<it2->first<<"\n";
-//                    ds2.Union(it->first,it2->first);
-//                }
-//
-//                it2++;
-//            }
-//            it++;
-//        }
-//        errs()<<"AFTER\n";
-//        ds2.printSet();
-//        // stage 3, get connected graph
-//        std::unordered_map<Instruction *, std::set<Instruction *>> toReplace;
-//        std::vector<Instruction *> toDelete;
-//        it = ds2.parent.begin();
-//        while(it!=ds2.parent.end()){
-//            if(ds2.getConnectedSize(it->first)>=2){
-//                if(it->first!=it->second){
-//                    CallInst *cat_new1 = cast<CallInst>(it->first);
-//                    CallInst *cat_new2 = cast<CallInst>(it->second);
-//                    Value *arg1 = cat_new1->getArgOperand(0);
-//                    Value *arg2 = cat_new2->getArgOperand(0);
-//                    if(cast<ConstantInt>(arg1)->getSExtValue()==cast<ConstantInt>(arg2)->getSExtValue()){
-//                        if(toReplace.find(ds2.Find(it->first))==toReplace.end()){
-//                            toReplace[ds2.Find(it->first)]=std::set<Instruction *>();
-//                            toReplace[ds2.Find(it->first)].insert(it->first);
-//                        }else{
-//                            toReplace[ds2.Find(it->first)].insert(it->first);
-//                        }
-//                    }
-//
-//                }
-//            }
-//
-//            it++;
-//        }
-//        // get the shared predecessor of all instruction
-//        std::unordered_map<Instruction *, std::vector<BasicBlock *>> toReplacePred;
-//        auto it_toReplace = toReplace.begin();
-//        while(it_toReplace!=toReplace.end()){
-//            std::set<BasicBlock *> bb_set;
-//            bb_set.insert(it_toReplace->first->getParent());
-//            for(auto item : it_toReplace->second){
-//                bb_set.insert(item->getParent());
-//            }
-//            BasicBlock *shared_pred = get_shared_pred(&bb_set);
-//        }
-//
-//        //ds.printSet();
-//        printtoreplace(toReplace);
-//
-//
-//
-//        // Transform
-////        auto iter = toReplace.begin();
-////        while(iter!=toReplace.end()){
-////            CallInst* head = build_CAT_new_Head(F);
-////            errs()<<"HEADING:"<<(*head)<<"\n";
-////            for(auto item:iter->second){
-////                //errs()<<"ITEM:"<<(*item)<<"\n";
-////                CallInst *call_instr = cast<CallInst>(item);
-////                int64_t num = cast<ConstantInt>(call_instr->getArgOperand(0))->getSExtValue();
-////                CallInst *sub = cast<CallInst>(build_cat_set(call_instr,num));
-////                errs()<<"REPLACING:"<<(*item)<<" with "<<(*sub)<<"\n";
-////            }
-////            iter++;
-////        }
-////        errs()<<"END\n";
-//    }
-//
-//    BasicBlock *get_shared_pred(std::set<BasicBlock *> *inst_set){
-//        auto iter = inst_set->begin();
-//        while(iter!=inst_set->end()){
-//            auto bb_iter = pred_begin(*iter);
-//            // go through BB
-//            std::set<BasicBlock> inter;
-//            while(bb_iter!=pred_end(*iter)){
-//
-//            }
-//        }
-//    }
-//
-//    void replace_instr_val(Instruction * instr, Value * val){
-//        BasicBlock::iterator ii(instr);
-//        BasicBlock * bb = instr->getParent();
-//        ReplaceInstWithValue(bb->getInstList(), ii, val);
-//    }
-//        void CAT_new_to_CAT_set(
-//                llvm::CallInst * CAT_new_old,
-//                llvm::CallInst * CAT_new_replace
-//        ) {
-//            IRBuilder<> builder(CAT_new_old);
-//
-//            Value * val = CAT_new_old->getArgOperand(0);
-//
-//            ArrayRef<Value *> arg_arr_ref = ArrayRef<Value *>{CAT_new_replace, val};
-//
-//            Value * added_set_instr = builder.CreateCall(CAT_set_ptr, arg_arr_ref);
-//
-//            // replacement
-//            replace_instr_val(CAT_new_old, CAT_new_replace);
-//        }
-//
-//    void printtoreplace(std::unordered_map<Instruction *, std::set<Instruction *> > toReplace){
-//        auto it = toReplace.begin();
-//        while(it!=toReplace.end()){
-//            for(auto it2 : it->second){
-//                errs()<<"Replacing "<<it2<<" with "<<it->first<<"\n";
-//            }
-//
-//            it++;
-//        }
-//
-//    }
 
 
     /**
