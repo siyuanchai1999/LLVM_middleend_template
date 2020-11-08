@@ -30,10 +30,7 @@ using namespace llvm;
 #define IN_SET(set, key) (set.find(key) != set.end())
 
 namespace {
-//     template<class T> class Set:public std::set<T>{
-//     public:
 
-// };
 struct CAT : public FunctionPass {
     static char ID; 
     Module *currentModule;
@@ -178,6 +175,35 @@ struct CAT : public FunctionPass {
         return str;
     }
 
+    std::string AliasResult_toString(AliasResult res){
+        std::string str;
+        switch (res)
+        {
+        case AliasResult::MustAlias :
+            str = "AliasResult::MustAlias";
+            break;
+
+        case AliasResult::MayAlias :
+            str = "AliasResult::MayAlias";
+            break;
+        
+        case AliasResult::PartialAlias :
+            str = "AliasResult::PartialAlias";
+            break;
+
+        case AliasResult::NoAlias :
+            str = "AliasResult::NoAlias";
+            break;
+
+
+        default:
+            str = "";
+            break;
+        }
+
+        return str;
+    }
+
     template<class T>
     void set_union(std::set<T> & srcA, std::set<T> & srcB, std::set<T> & target){
         std::vector<T> output_vec = std::vector<T>(srcA.size() + srcB.size());
@@ -259,6 +285,20 @@ struct CAT : public FunctionPass {
             if (str == "CAT_get") {CAT_get_ptr = fptr;}
             if (str == "CAT_set") {CAT_set_ptr = fptr;}
         }
+
+
+        /**
+         * Find all cat_new call in the function
+        * */
+        for (Function & F: M) {
+            for (Instruction & inst : instructions(F)) {
+                if (IS_CAT_new(get_callee_ptr(&inst))) {
+                    CAT_new_collect.insert(&inst);
+                }
+            }
+            
+        }
+
         return false;
         
     }
@@ -411,10 +451,6 @@ struct CAT : public FunctionPass {
 
                 sVar2Def[&arg].insert(&arg);
 
-                /**
-                 * Assume all pointers are CAT variables??
-                 * */
-                CAT_new_collect.insert(&arg);
             } 
         }
 
@@ -433,7 +469,6 @@ struct CAT : public FunctionPass {
                         if (IS_CAT_new(callee_ptr)) {
                             key = call_instr;
 
-                            CAT_new_collect.insert(call_instr);
                         } else {
                             // get first operand if CAT_set, CAT_add, CAT_sub
 
@@ -471,7 +506,8 @@ struct CAT : public FunctionPass {
                                     ModRefInfo info = AA.getModRefInfo(call_instr, memLoc); 
 
 
-                                    errs() << *call_instr << " has arg " << *arg << " at " << arg << " ModRefInfo = " << ModRefInfo_toString(info) <<'\n';
+                                    errs() << *call_instr << " has arg " << *arg << " at " << arg;
+                                    errs() << "arg points to " << *possible_vals[j] <<  " with ModRefInfo = " << ModRefInfo_toString(info) <<'\n';
                                     if (HAS_MOD(info)){
                                         
                                         dummy_def_val(possible_vals[j], call_instr);
@@ -1628,8 +1664,11 @@ struct CAT : public FunctionPass {
         for (auto & cat_var : CAT_new_collect) {
             if (cat_var != arg){
                 AliasResult AAResult = AA.alias(cat_var, arg);
+
+                errs() << "At instruction : " << *instr; 
+                errs() << *arg << " at " << arg << " alias with " << *cat_var << " at " << cat_var;
+                errs() << " with result = " << AliasResult_toString(AAResult) << '\n';
                 if (AAResult == AliasResult::MustAlias) {
-                    errs() << *arg << " at " << arg << " alias with " << *cat_var << " at " << cat_var << '\n';
                     aliases.push_back(cat_var);
                 }
             }
