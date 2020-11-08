@@ -81,8 +81,8 @@ struct CAT : public FunctionPass {
     std::set<Value *> cat_arg;
 #define IN_CAT_ARG(ptr) (cat_arg.find(ptr)!=cat_arg.end())
 
-    std::unordered_map<Function *, std::set<Value*>> cat_var;
-
+    std::set<Value*> cat_var;
+#define IS_CAT_VAR(ptr) (cat_var.find(ptr)!=cat_var.end())
     std::set<Value *> arg_set;
     std::set<Value *> CAT_new_collect;
     //Generic IN / OUT set
@@ -94,6 +94,18 @@ struct CAT : public FunctionPass {
     std::unordered_map<Value*, std::set<Value*>> sBB_KILL;
     std::unordered_map<Value *, std::set<Value*>> sBB_IN, sBB_OUT;
     std::unordered_map<Value *, std::set<Value*>> sIN, sOUT;
+    std::unordered_map<Value *, Value*> ptrToVal;
+
+    // May-Point-to Analysis
+    std::unordered_map<Value *, std::set<std::pair<Value*, Value*>>> mptGEN; // instruction -> {(p,x)}
+    std::unordered_map<Value *, std::set<std::pair<Value*, Value*>>> mptKILL; // instruction -> {(p,v)| v escaped}
+    std::unordered_map<Value *, std::set<Value *>> ptr2Val; // p->{x | for all x that (p,x) };
+    std::unordered_map<Value *, std::set<Value *>> val2Ptr; // x->{p | for all p that (p,x) }
+    std::unordered_map<Value *, std::set<std::pair<Value*, Value*>>> mptIN;
+    std::unordered_map<Value *, std::set<std::pair<Value*, Value*>>> mptOUT;
+
+
+    std::unordered_map<Value*, std::set<Value*>> mayPointTo;
     
     /**
      * maps from user call to a map from its argument to replacement
@@ -253,6 +265,14 @@ struct CAT : public FunctionPass {
         target = std::set<T>(output_vec.begin(), output_vec.end());
     }
 
+    // May-point-to analysis
+    template<class T>
+    class PairSet{
+        public:
+            std::set<std::pair<T,T>> pairSet;
+
+        };
+
     // deadcode elimination
     std::unordered_map<llvm::Instruction *, llvm::BitVector> live_GEN_INST, live_KILL_INST;
     std::unordered_map<llvm::Instruction *, llvm::BitVector> live_IN_INST, live_OUT_INST;
@@ -358,36 +378,36 @@ struct CAT : public FunctionPass {
         AU.addRequired<AAResultsWrapperPass>();
     }
 
-    void findCatVariables(Function &F){
-        for(auto &inst: instructions(F)){
-            if(isa<CallInst>(inst)){
-                CallInst* callInst = cast<CallInst>(&inst);
-                Function* callee_ptr = callInst->getCalledFunction();
-                if(fptr2name.find(callee_ptr) != fptr2name.end()){
-                    std::string callee_name = fptr2name[callee_ptr];
-                    //CAT_set, first operand is a CAT var
-                    if(callee_name=="CAT_set"){
-                        // tail call void @CAT_set(i8* %8, i64 42) #3
-                        Value *arg = callInst->getArgOperand(0);
-                        cat_var[&F].insert(arg);
-                    }
-                    //CAT_add, CAT_sub all of their operands are CAT var
-                    if(callee_name=="CAT_add"||callee_name=="CAT_sub"){
-                        //tail call void @CAT_add(i8* %8, i8* %8, i8* %8) #3
-//                            Value* arg1 = callInst->getArgOperand(0);
-//                            Value* arg2 = callInst->getArgOperand(1);
-//                            Value* arg3 = callInst->getArgOperand(2);
-                        cat_var[&F].insert(callInst->arg_begin(),callInst->arg_end());
-                    }
-                    //CAT_new, the instruction itself is CAT var
-                    if(callee_name=="CAT_new"){
-                        cat_var[&F].insert(&inst);
-                    }
-                }
-            } 
-
-        }
-    }
+//    void findCatVariables(Function &F){
+//        for(auto &inst: instructions(F)){
+//            if(isa<CallInst>(inst)){
+//                CallInst* callInst = cast<CallInst>(&inst);
+//                Function* callee_ptr = callInst->getCalledFunction();
+//                if(fptr2name.find(callee_ptr) != fptr2name.end()){
+//                    std::string callee_name = fptr2name[callee_ptr];
+//                    //CAT_set, first operand is a CAT var
+//                    if(callee_name=="CAT_set"){
+//                        // tail call void @CAT_set(i8* %8, i64 42) #3
+//                        Value *arg = callInst->getArgOperand(0);
+//                        cat_var[&F].insert(arg);
+//                    }
+//                    //CAT_add, CAT_sub all of their operands are CAT var
+//                    if(callee_name=="CAT_add"||callee_name=="CAT_sub"){
+//                        //tail call void @CAT_add(i8* %8, i8* %8, i8* %8) #3
+////                            Value* arg1 = callInst->getArgOperand(0);
+////                            Value* arg2 = callInst->getArgOperand(1);
+////                            Value* arg3 = callInst->getArgOperand(2);
+//                        cat_var[&F].insert(callInst->arg_begin(),callInst->arg_end());
+//                    }
+//                    //CAT_new, the instruction itself is CAT var
+//                    if(callee_name=="CAT_new"){
+//                        cat_var[&F].insert(&inst);
+//                    }
+//                }
+//            }
+//
+//        }
+//    }
 
         //naive GEN KILL IN OUT
     void sGEN_sKILL_init() {
@@ -409,7 +429,227 @@ struct CAT : public FunctionPass {
         sOUT.clear();
 
         arg_set.clear();
+        mayPointTo.clear();
+        mptGEN.clear();
+        mptKILL.clear();
+
+        ptr2Val.clear();
+        val2Ptr.clear();
+
     }
+    void findCATVar(Function &F){
+            cat_var.clear();
+            for(auto& inst:instructions(F)){
+                if(isa<CallInst>(&inst)){
+                    CallInst *callInst = cast<CallInst>(&inst);
+                    Function *callee = callInst->getCalledFunction();
+                    if(IS_CAT_new(callee))
+                        cat_var.insert(&inst);
+                    if(IS_CAT_add(callee)||IS_CAT_sub(callee)){
+                        int num = callInst->getNumArgOperands();
+                        for(auto i = 0; i<num;i++){
+                            Value *arg = callInst->getArgOperand(i);
+                            if(isa<PHINode>(arg))
+                                findCATVarHelper(arg);
+                            if(isa<CallInst>(arg))
+                                cat_var.insert(arg);
+                        }
+                    }else
+                    if(IS_CAT_set(callee)||IS_CAT_get(callee)){
+                        Value *arg = callInst->getArgOperand(0);
+                        if(isa<PHINode>(arg))
+                            findCATVarHelper(arg);
+                        cat_var.insert(arg);
+                    }
+
+                }
+            }
+        }
+        void findCATVarHelper(Value *arg){
+            PHINode *phi = cast<PHINode>(arg);
+            uint32_t numIncoming = phi->getNumIncomingValues();
+            for(auto i=0;i<numIncoming;i++){
+             Value* arg = phi->getIncomingValue(i);
+             if(isa<PHINode>(arg))
+                 findCATVarHelper( arg);
+             if(isa<CallInst>(arg)){
+                 CallInst *callInst = cast<CallInst>(arg);
+                 Function *callee = callInst->getCalledFunction();
+                 if(IS_CAT_new(callee))
+                     cat_var.insert(arg);
+                 if(IS_CAT_add(callee)||IS_CAT_sub(callee)){
+                     int num = callInst->getNumArgOperands();
+                     for(auto i = 0; i<num;i++){
+                         Value *arg = callInst->getArgOperand(i);
+                         if(isa<PHINode>(arg))
+                             findCATVarHelper(arg);
+                         if(isa<CallInst>(arg))
+                             cat_var.insert(arg);
+                     }
+                 }else
+                 if(IS_CAT_set(callee)||IS_CAT_get(callee)){
+                     Value *arg = callInst->getArgOperand(0);
+                     if(isa<PHINode>(arg))
+                         findCATVarHelper(arg);
+                     cat_var.insert(arg);
+                 }
+             }
+
+            }
+        }
+
+
+    void mptGEN_KILL(Function &F){
+            findCATVar(F);
+            std::set<Value *> escapedVar;
+
+            // May-Point-To GEN
+            for(auto &bb : F){
+                for(auto &inst: bb){
+                    if(isa<StoreInst>(&inst)){
+                        StoreInst *storeInst = cast<StoreInst>(&inst);
+                        Value *valueStored = storeInst->getValueOperand();
+                        Value *ptrOperand = storeInst->getPointerOperand();
+                        // If p -> v
+                        mptGEN[&inst].insert(std::make_pair(ptrOperand,valueStored));
+                        ptr2Val[ptrOperand].insert(valueStored);
+//                        escapedVar.insert(valueStored);
+//                        if(IS_CAT_VAR(valueStored)){
+//                            mptGEN[&inst].insert(std::make_pair(ptrOperand,valueStored));
+//                            val2Ptr[valueStored].insert(ptrOperand);
+//                            ptr2Val[ptrOperand].insert(valueStored);
+//                            // this var may escape
+//                            // FIXME: or only function can escape this variable
+//                            escapedVar.insert(valueStored);
+//                        }else{
+//                            // p -> q
+//                            mptGEN[&inst].insert(std::make_pair(ptrOperand,valueStored));
+//                        }
+                        // If p -> q
+                        // do nothing, no GEN
+                    }
+                }
+            }
+            // Find escape var
+            for(auto& BB :F){
+                for(auto& inst:BB){
+                    /**
+                     *  Only when calling user defined function will a variable escape, mark that var
+                     *
+                     */
+                    if(isa<CallInst>(&inst)){
+                        CallInst *callInst = cast<CallInst>(&inst);
+                        Function *callee = callInst->getCalledFunction();
+                        if(IS_USER_FUNC(callee)){
+                            uint32_t num = callInst->getNumArgOperands();
+                            for(auto i=0;i<num;i++){
+                                Value * arg = callInst->getArgOperand(i);
+                                if(isa<PointerType>(arg->getType())){
+                                    Value *var = getVar(arg);
+                                    if(IS_CAT_VAR(var))
+                                        escapedVar.insert(var);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            // MPT KILL
+            // KILL only if this ptr escaped
+            for(auto &&bb : F){
+                for(auto &inst: bb){
+                    if(isa<StoreInst>(&inst)){
+                        StoreInst *storeInst = cast<StoreInst>(&inst);
+                        Value *valueStored = storeInst->getValueOperand();
+                        Value *ptrOperand = storeInst->getPointerOperand();
+                        // If p -> v, just insert every escaped var here
+                        if(IS_CAT_VAR(valueStored)){
+                            for(auto& e:escapedVar){
+                                // {(p,v)| v escaped}
+                                mptKILL[&inst].insert(std::make_pair(ptrOperand,e));
+                            }
+                        }
+                    }
+//                    if(isa<CallInst>(&inst)){
+//                     CallInst* callInst  = cast<CallInst>(&inst);
+//                     Function* callee = callInst->getCalledFunction();
+//                     // if escaped
+//                     if(IS_USER_FUNC(callee)){
+//                         uint32_t num_arg = callInst->getNumArgOperands();
+//                         for (uint32_t i = 0; i < num_arg; i++) {
+//                             Value * arg = callInst->getArgOperand(i);
+//                             mptKill(&inst,arg); //inst, p
+//                         }
+//                     }
+//                    }
+                }
+            }
+        }
+
+        void mptIN_OUT(Function &F){
+            // GEN KILL for each BB
+            std::unordered_map<Value *, std::set<std::pair<Value*,Value*>>> mptBB_IN;
+            std::unordered_map<Value *, std::set<std::pair<Value*,Value*>>> mptBB_OUT;
+            for(auto &BB:F){
+                mptBB_IN[&BB] = std::set<std::pair<Value*,Value*>>();
+                mptBB_OUT[&BB] = std::set<std::pair<Value*,Value*>>();
+            }
+            bool changed;
+            do{
+                changed = false;
+                for(auto& BB:F){
+                    for(auto Pred:predecessors(&BB)){
+                        std::set<std::pair<Value*,Value*>> temp;
+                        set_union(mptBB_IN[&BB],mptBB_OUT[Pred],temp);
+                        mptBB_IN[&BB] = temp;
+                    }
+                    std::set<std::pair<Value*,Value*>> local_IN = mptBB_IN[&BB];
+                    std::set<std::pair<Value*,Value*>> local_OUT = mptBB_IN[&BB];
+                    for(auto& inst:BB){
+                        local_IN = local_OUT;
+                        mptIN[&inst] = local_IN;
+                        if(isa<StoreInst>(&inst)){
+
+                            StoreInst *storeInst = cast<StoreInst>(&inst);
+                            Value *valueStored = storeInst->getValueOperand();
+                            Value *ptrOperand = storeInst->getPointerOperand();
+                            // if p->v
+
+                            std::set<std::pair<Value*,Value*>> temp;
+                            // TEMP = IN[i] - KILL[i]
+                            set_diff(local_IN,mptKILL[&inst],temp);
+                            // OUT[i] = GEN[i] U TEMP
+                            std::set<std::pair<Value*,Value*>> out;
+                            set_union(temp,mptGEN[&inst],out);
+                            if(!changed){
+                                changed = (out!=mptOUT[&inst]);
+                            }
+                            local_OUT = out;
+
+                        }
+                        mptOUT[&inst] = local_OUT;
+                    }
+                    mptBB_OUT[&BB]=local_OUT;
+                }
+
+            }while(changed);
+
+
+        }
+        Value* getVar(Value *arg){
+            if(IN_MAP(ptrToVal, arg)){
+                Value* next_arg = ptrToVal[arg];
+                return getVar(next_arg);
+            }
+            return arg;
+        }
+        void mptKill(Value *inst,Value *arg){
+            if (isa<PointerType>(arg->getType())) {
+                for(auto &val:ptr2Val[arg]){
+                    mptKILL[inst].insert(std::make_pair(arg,val));
+                }
+            }
+        }
 
     /**
      *  Expect arg to be a pointer 
@@ -437,6 +677,7 @@ struct CAT : public FunctionPass {
         
     }
 
+
     void sGEN_sKILL(Function &F, AliasAnalysis & AA){
         /**
          *  Handling GEN KILL for Function argument
@@ -444,7 +685,7 @@ struct CAT : public FunctionPass {
         
         for (Argument &arg:  F.args()){
             if (isa<PointerType>(arg.getType())) {
-                // errs() << " Function " << F.getName() << " has arg " << arg << '\n';
+
                 
                 arg_set.insert(&arg);
                 sGEN.insert(&arg);
@@ -538,7 +779,12 @@ struct CAT : public FunctionPass {
                     sVar2Def[phi].insert(phi);
                 }
                 
-            }   
+            } else if (isa<StoreInst>(&inst)){
+                StoreInst *storeInst = cast<StoreInst>(&inst);
+                Value* valueStored = storeInst->getValueOperand();
+                Value* ptrOperand = storeInst->getPointerOperand();
+                ptrToVal[ptrOperand] = valueStored;
+            }
 
         }
 
