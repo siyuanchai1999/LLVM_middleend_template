@@ -94,6 +94,8 @@ struct CAT : public FunctionPass {
     std::unordered_map<Value*, std::set<Value*>> sBB_KILL;
     std::unordered_map<Value *, std::set<Value*>> sBB_IN, sBB_OUT;
     std::unordered_map<Value *, std::set<Value*>> sIN, sOUT;
+    // maps gen instruction to variable it defines
+    
     std::unordered_map<Value *, Value*> ptrToVal;
 
     // May-Point-to Analysis
@@ -116,23 +118,7 @@ struct CAT : public FunctionPass {
     std::map<Instruction *, std::map<Value *, Instruction *>> userCall2replace;
     std::map<Instruction *, std::pair<Instruction *, Value * >> replace2userCall;
 
-    /**
-     *  WARNING!!! 
-     * 
-    void set_intersect(std::set<Value*> const &a,std::set<Value*> const &b, std::set<Value*> &ret){
-        std::set_intersection(a.begin(),a.end(),b.begin(),b.end(),std::inserter(ret,ret.begin()));
-    }
-    void set_diff(std::set<Value*> const &a,std::set<Value*> const &b, std::set<Value*> &ret){
-        std::set_difference(a.begin(),a.end(),b.begin(),b.end(),std::inserter(ret,ret.begin()));
-    }
-    void set_union(std::set<Value*> const &a,std::set<Value*> const &b, std::set<Value*> &ret){
-        ret.insert(a.begin(),a.end());
-        ret.insert(b.begin(),b.end());
-    }
-    void set_xor(std::set<Value*> const &a,std::set<Value*> const &b, std::set<Value*> &ret){
-       std::set_symmetric_difference(a.begin(),a.end(),b.begin(),b.end(),std::inserter(ret,ret.begin()));
-    }
-    */
+#define IS_PTR_TYPE(val) (isa<PointerType>(val->getType()) )
 
 #define HAS_MOD(info) (\
         info == ModRefInfo::MustMod \
@@ -307,17 +293,17 @@ struct CAT : public FunctionPass {
         }
 
 
-        /**
-         * Find all cat_new call in the function
-        * */
-        for (Function & F: M) {
-            for (Instruction & inst : instructions(F)) {
-                if (IS_CAT_new(get_callee_ptr(&inst))) {
-                    CAT_new_collect.insert(&inst);
-                }
-            }
+        // /**
+        //  * Find all cat_new call in the function
+        // * */
+        // for (Function & F: M) {
+        //     for (Instruction & inst : instructions(F)) {
+        //         if (IS_CAT_new(get_callee_ptr(&inst))) {
+        //             CAT_new_collect.insert(&inst);
+        //         }
+        //     }
             
-        }
+        // }
 
         return false;
         
@@ -330,7 +316,7 @@ struct CAT : public FunctionPass {
         //findCatVariables(F);
         //phi_node_new2set(F);
         AliasAnalysis & AA = getAnalysis<AAResultsWrapperPass>().getAAResults();
-        findCATVar(F);
+        
         sGEN_sKILL_init();
         mptGEN_KILL(F);
         mptIN_OUT(F);
@@ -349,18 +335,6 @@ struct CAT : public FunctionPass {
         sIN_OUT_inst(F);
         // print_in_out(F);
 
-//        H1_init(F);
-//        H1_GEN_KILL(F);
-//        // H1_output(caller_name);
-//
-//        H2_init(F);
-//        H2_IN_OUT(F);
-//        instruction_IN_OUT(F);
-//        //H2_output(caller_name,F);
-//
-//        
-//        find_escaped(F);
-//
         
         constant_folding(F, AA);
 
@@ -436,8 +410,8 @@ struct CAT : public FunctionPass {
         res.push_back(op2);
     }
  
-    void mptGEN_KILL(Function &F){
-        // findCATVar(F);
+    void mptGEN_KILL(Function &F, AliasAnalysis & AA){
+        findCATVar(F);
         std::set<Value *> escapedVar;
 
         // May-Point-To GEN
@@ -461,7 +435,37 @@ struct CAT : public FunctionPass {
                         }
                     }
                     
-                }
+                } 
+                // else if (isa<CallInst>(&inst)) {
+                //     CallInst * call_instr = cast<CallInst>(&inst);
+                //     Function * callee_ptr = call_instr->getCalledFunction();
+
+                //     if (IS_CAT_OP(callee_ptr)) {
+                //         /**
+                //          *  Do nothing. CAT operation never changes point-to analysis
+                //          * */
+                //     } else if (IS_USER_FUNC(callee_ptr)) {
+                //         uint32_t num_arg = call_instr->getNumArgOperands();
+                //         for (uint32_t i = 0; i < num_arg; i++) {
+                //             Value * arg = call_instr->getArgOperand(i);
+
+                //             if (IS_PTR_TYPE(arg) && !IS_CAT_VAR(arg) ) {
+                //                 /**
+                //                  *  This is a pointer but not a CAT variable
+                //                  *      This has the suspicion of being a pointer to CAT variable
+                //                  * */
+                //                 ModRefInfo ModRefResult = AA.getArgModRefInfo(call_instr, i);
+                //                 if (HAS_MOD(ModRefResult)) {
+
+                //                 }
+                //             }
+                //         }
+                //     } else {
+                //         /**
+                //          *  Do nothing. standard lib function
+                //          * */
+                //     }
+                // }
             }
         }
 
@@ -474,9 +478,15 @@ struct CAT : public FunctionPass {
             StoreInst * storeInst = cast<StoreInst>(kv.first);
             Value * ptr = storeInst->getPointerOperand();
 
-            for (Value * val : ptr2Val[ptr]) {
+            // for (Value * val : ptr2Val[ptr]) {
+            //     mptKILL[storeInst].insert(
+            //         std::make_pair(ptr, val)
+            //     );
+            // }
+
+            for (Value * var: cat_var) {
                 mptKILL[storeInst].insert(
-                    std::make_pair(ptr, val)
+                    std::make_pair(ptr, var)
                 );
             }
         }
@@ -657,23 +667,30 @@ struct CAT : public FunctionPass {
         return newInst;
     }
 
-    void dummy_def_val(Value * val, CallInst * call_instr){
+    void GEN_record_info (
+        Value * gen, 
+        Value * var,
+        std::unordered_map<Value *, Value*> & sGEN2var
+    ) {
+        sGEN.insert(gen);
+        sVar2Def[var].insert(gen);
+        sGEN2var[gen] = var;
+    }
+
+    Instruction * dummy_def_val(Value * val, CallInst * call_instr){
         Instruction * dummy = dummy_instr_create();
 
         userCall2replace[call_instr][val] = dummy;
         replace2userCall[dummy] = std::make_pair(call_instr, val);
 
-        sGEN.insert(dummy);
-        sVar2Def[val].insert(dummy);
-
-        
+        return dummy;
     }
 
     /**
      *  Given call instruction on CAT_set, CAT_add, CAT_sub
      *      find target of operation
      * */
-    Value * get_define_target(CallInst * call_instr) {
+    Value * get_define_target(CallInst * call_instr, AliasAnalysis & AA) {
 
         Value * key = NULL;
         Value * arg0 = call_instr->getArgOperand(0);
@@ -694,7 +711,16 @@ struct CAT : public FunctionPass {
             Value * ptr = loadInst->getPointerOperand();
             Value * val = must_point2(call_instr, ptr);
             
-            key = val ? val : arg0;
+            if (val) key = val;
+            if (!key) {
+                key = arg0;
+                for (auto & vardef : sVar2Def) {
+                    Value * var = vardef.first;
+                    if (CAT_Alias(AA, var, arg0) == AliasResult::MustAlias) {
+                        key = var;   
+                    }
+                }
+            }
         }
 
         return key;
@@ -702,18 +728,24 @@ struct CAT : public FunctionPass {
 
     void sGEN_sKILL(Function &F, AliasAnalysis & AA){
         /**
+         *  Map from gen (instruction) to variable that such gen defines
+         *  Used to make life easier for KILL calculation
+         * */
+        std::unordered_map<Value *, Value*> sGEN2var;
+        /**
          *  Handling GEN KILL for Function argument
          * */
         
         for (Argument &arg:  F.args()){
             if (isa<PointerType>(arg.getType())) {
-
-                
+       
                 arg_set.insert(&arg);
-                sGEN.insert(&arg);
 
-                sVar2Def[&arg].insert(&arg);
-
+                GEN_record_info(
+                            &arg,    /* gen value */
+                            &arg,    /* Variable that gen defines*/
+                            sGEN2var /* local info recorder*/
+                );
             } 
         }
 
@@ -726,7 +758,6 @@ struct CAT : public FunctionPass {
                 if (IS_CAT_OP(callee_ptr)) {
                 
                     if (!IS_CAT_get(callee_ptr)) {
-                        sGEN.insert(call_instr);
 
                         Value * key;
                         if (IS_CAT_new(callee_ptr)) {
@@ -735,10 +766,14 @@ struct CAT : public FunctionPass {
                         } else {
                             // get first operand if CAT_set, CAT_add, CAT_sub
 
-                            key = get_define_target(call_instr);
+                            key =  get_define_target(call_instr, AA);
                         }
-
-                        sVar2Def[key].insert(call_instr);
+                        
+                        GEN_record_info(
+                                    call_instr,    /* gen value */
+                                    key,    /* Variable that gen defines*/
+                                    sGEN2var /* local info recorder*/
+                        );
                     }
 
                 } else if (IS_USER_FUNC(callee_ptr)){
@@ -756,22 +791,6 @@ struct CAT : public FunctionPass {
                          *  
                          * */
                         if (isa<PointerType>(arg->getType())) {
-                            // std::vector<Value *> possible_vals;
-                            // ptr_trace_back(arg, possible_vals);
-
-                            // for (uint32_t j = 0; j < possible_vals.size(); j++) {
-                                
-                            //         MemoryLocation memLoc(possible_vals[j]);
-                            //         ModRefInfo info = AA.getModRefInfo(call_instr, memLoc); 
-
-
-                            //         errs() << *call_instr << " has arg " << *arg << " at " << arg;
-                            //         errs() << "arg points to " << *possible_vals[j] <<  " with ModRefInfo = " << ModRefInfo_toString(info) <<'\n';
-                            //         if (HAS_MOD(info)){
-                                        
-                            //             dummy_def_val(possible_vals[j], call_instr);
-                            //         }
-                            // }
 
                             std::vector<Value *> possible_vals;
                             // may_point2(&inst, arg , possible_vals);
@@ -788,7 +807,13 @@ struct CAT : public FunctionPass {
                                 errs() << "arg points to " << *possible_vals[j] <<  " with ModRefInfo = " << ModRefInfo_toString(info) <<'\n';
                                 if (HAS_MOD(info)){
                                     
-                                    dummy_def_val(possible_vals[j], call_instr);
+                                    Value * dummy = dummy_def_val(possible_vals[j], call_instr);
+                                    
+                                    GEN_record_info(
+                                                dummy,               /* gen value, used dummy instruction as the gen*/
+                                                possible_vals[j],    /* Variable that gen defines*/
+                                                sGEN2var             /* local info recorder*/
+                                    );
                                 }
                             }
                         }                
@@ -798,8 +823,12 @@ struct CAT : public FunctionPass {
                      * If call instruction itself returns a pointer
                      * */
                     if (isa<PointerType>(call_instr->getType())) {
-                        sGEN.insert(call_instr);
-                        sVar2Def[call_instr].insert(call_instr);
+
+                        GEN_record_info(
+                                    call_instr,          /* pointer returns by funciont */
+                                    call_instr,         /* defines itself*/
+                                    sGEN2var             /* local info recorder*/
+                        );
                     }
                 }
 
@@ -810,65 +839,24 @@ struct CAT : public FunctionPass {
                  * only phi node with Pointer type we should care, right?
                  * */
                 if (isa<PointerType> (phi->getType())){
-                    // errs() << *phi <<  " with type " << *phi->getType() << '\n';
-                    sGEN.insert(phi);
+                    GEN_record_info(
+                                phi,          /* phi pointer */
+                                phi,         /* defines itself*/
+                                sGEN2var     /* local info recorder*/
+                    );
 
-                    sVar2Def[phi].insert(phi);
                 }
                 
-            } else if (isa<StoreInst>(&inst)){
-                StoreInst *storeInst = cast<StoreInst>(&inst);
-                Value* valueStored = storeInst->getValueOperand();
-                Value* ptrOperand = storeInst->getPointerOperand();
-                ptrToVal[ptrOperand] = valueStored;
-            }
+            } 
 
         }
-
 
         /**
          *  Generating KILL per instruction
          * */ 
-        for(Value * gen : sGEN){
-
-            if (isa<CallInst>(gen)){
-                CallInst * call_instr = cast<CallInst>(gen);
-                Function * callee_ptr = call_instr->getCalledFunction();
-
-                if (IS_CAT_OP(callee_ptr)) {
-
-                    if (!IS_CAT_get(callee_ptr)) {
-
-                        Value * key;
-                        if (IS_CAT_new(callee_ptr)) {
-                            key = call_instr;
-                        } else {
-                            // get first operand if CAT_set, CAT_add, CAT_sub
-                            key = get_define_target(call_instr);
-                        }
-
-                        sKILL[gen] =  sVar2Def[key];
-                    }
-
-                } else if (IS_USER_FUNC(callee_ptr)) {
-                    sKILL[gen] =  sVar2Def[call_instr];
-                }
-
-            } else if (isa<PHINode>(gen)) {
-                PHINode * phi = cast<PHINode> (gen);
-                sKILL[gen] =  sVar2Def[phi];
-
-            } else if (IN_MAP(replace2userCall, (Instruction *)gen)) {
-                /**
-                 * This is a dummy instruction created by ourselves
-                 * */
-                Instruction * dummy = cast<Instruction> (gen);
-                Instruction * call_inst = replace2userCall[dummy].first;
-                Value * arg = replace2userCall[dummy].second;
-
-                sKILL[gen] =  sVar2Def[arg];
-            }
-
+        for (Value * gen: sGEN) {
+            Value * var = sGEN2var[gen];
+            sKILL[gen] = sVar2Def[var];
             sKILL[gen].erase(gen);
         }
     }
@@ -1128,12 +1116,6 @@ struct CAT : public FunctionPass {
         for(auto& i:p_set){
             errs() << " " << *i << '\n';
         }
-    }
-    void eliminate_multiple_definition(){
-
-    }
-    void ok(){
-
     }
 
 
@@ -1889,6 +1871,13 @@ struct CAT : public FunctionPass {
         return true;
     }
 
+    template<typename T>
+    bool vec_is_equal(std::vector<T> const &v1, std::vector<T> const &v2)
+    {
+        return (v1.size() == v2.size() &&
+                std::equal(v1.begin(), v1.end(), v2.begin()));
+    }
+
 
     // create set instruction before cat_add or cat_sub
     Value * build_cat_set(CallInst * call_instr, int64_t set_val) {
@@ -1989,12 +1978,16 @@ struct CAT : public FunctionPass {
     }
 
     /**
-     *  return all results that ptr can point
+     *  return all (p, v) pairs that has p == ptr
      * */
-    void may_point2(Instruction * instr, Value * ptr, std::vector<Value *> & res) {
+    void mpt_ptr_selection(
+        Instruction * instr, 
+        Value * ptr, 
+        std::vector<std::pair<Value *, Value *>> & res
+    ) {
         for (auto &pv: mptIN[instr]) {
             if (pv.first == ptr) {
-                res.push_back(pv.second);
+                res.push_back(pv);
             }
         }
     }
@@ -2026,9 +2019,18 @@ struct CAT : public FunctionPass {
         if (isa<LoadInst>(valA) && isa<LoadInst>(valB)) {
             LoadInst * loadA = cast<LoadInst>(valA);
             LoadInst * loadB = cast<LoadInst>(valB);
+            Value * ptrA = loadA->getPointerOperand();
+            Value * ptrB = loadB->getPointerOperand();
 
-            if (loadA->getPointerOperand() == loadB->getPointerOperand()) {
-                return AliasResult::MustAlias;
+            if (ptrA == ptrB) {
+                std::vector<std::pair<Value *, Value *>> pv_pairA, pv_pairB;
+                mpt_ptr_selection(loadA, ptrA, pv_pairA);
+                mpt_ptr_selection(loadA, ptrA, pv_pairB);
+
+                if (vec_is_equal(pv_pairA, pv_pairB)){
+                    return AliasResult::MustAlias;
+                }
+                
             }
         }
         return AAResult;
