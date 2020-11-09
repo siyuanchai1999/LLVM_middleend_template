@@ -106,7 +106,9 @@ struct CAT : public FunctionPass {
     std::unordered_map<Value *, std::set<Value *>> val2Ptr; // x->{p | for all p that (p,x) }
     std::unordered_map<Value *, std::set<std::pair<Value*, Value*>>> mptIN;
     std::unordered_map<Value *, std::set<std::pair<Value*, Value*>>> mptOUT;
-
+    std::unordered_map<Value *, std::set<Value *>> ptr2AliasPtrs;
+    std::unordered_map<Value *, std::set<Value *>> ptr2Ptr;
+    std::unordered_map<Value *, Value*> mustAliasing;
 
     std::unordered_map<Value*, std::set<Value*>> mayPointTo;
     
@@ -144,6 +146,7 @@ struct CAT : public FunctionPass {
     || info == ModRefInfo::ModRef \
 )
 
+#define MUST_MOD(info)(info==ModRefInfo::MustMod||info==ModRefInfo::MustModRef)
 #define NO_MOD(info) (!HAS_MOD(info))
 
     std::string ModRefInfo_toString(ModRefInfo info){
@@ -298,33 +301,37 @@ struct CAT : public FunctionPass {
         // H0_output(caller_name);
 
         sGEN_sKILL_init();
+        mptGEN_KILL(F);
+        mptIN_OUT(F);
         sGEN_sKILL(F, AA);
-        //print_gen_kill(caller_name,F);
         sIN_sOUT(F);
         sIN_OUT_inst(F);
-        // print_in_out(F);
-
-//        H1_init(F);
-//        H1_GEN_KILL(F);
-//        // H1_output(caller_name);
-//
-//        H2_init(F);
-//        H2_IN_OUT(F);
-//        instruction_IN_OUT(F);
-//        //H2_output(caller_name,F);
-//
-//        
-//        find_escaped(F);
-//
-        
         constant_folding(F, AA);
 
 
         sGEN_sKILL_init();
+        mptGEN_KILL(F);
+        mptIN_OUT(F);
         sGEN_sKILL(F, AA);
         sIN_sOUT(F);
         sIN_OUT_inst(F);
         constant_propagation(F, AA);
+
+//        sGEN_sKILL_init();
+//        mptGEN_KILL(F);
+//        mptIN_OUT(F);
+//        sGEN_sKILL(F, AA);
+//        sIN_sOUT(F);
+//        sIN_OUT_inst(F);
+//        constant_folding(F, AA);
+//
+//        sGEN_sKILL_init();
+//        mptGEN_KILL(F);
+//        mptIN_OUT(F);
+//        sGEN_sKILL(F, AA);
+//        sIN_sOUT(F);
+//        sIN_OUT_inst(F);
+//        constant_propagation(F, AA);
     //    constant_propagation(F);
         return false;
     }
@@ -338,47 +345,9 @@ struct CAT : public FunctionPass {
         AU.addRequired<AAResultsWrapperPass>();
     }
 
-//    void findCatVariables(Function &F){
-//        for(auto &inst: instructions(F)){
-//            if(isa<CallInst>(inst)){
-//                CallInst* callInst = cast<CallInst>(&inst);
-//                Function* callee_ptr = callInst->getCalledFunction();
-//                if(fptr2name.find(callee_ptr) != fptr2name.end()){
-//                    std::string callee_name = fptr2name[callee_ptr];
-//                    //CAT_set, first operand is a CAT var
-//                    if(callee_name=="CAT_set"){
-//                        // tail call void @CAT_set(i8* %8, i64 42) #3
-//                        Value *arg = callInst->getArgOperand(0);
-//                        cat_var[&F].insert(arg);
-//                    }
-//                    //CAT_add, CAT_sub all of their operands are CAT var
-//                    if(callee_name=="CAT_add"||callee_name=="CAT_sub"){
-//                        //tail call void @CAT_add(i8* %8, i8* %8, i8* %8) #3
-////                            Value* arg1 = callInst->getArgOperand(0);
-////                            Value* arg2 = callInst->getArgOperand(1);
-////                            Value* arg3 = callInst->getArgOperand(2);
-//                        cat_var[&F].insert(callInst->arg_begin(),callInst->arg_end());
-//                    }
-//                    //CAT_new, the instruction itself is CAT var
-//                    if(callee_name=="CAT_new"){
-//                        cat_var[&F].insert(&inst);
-//                    }
-//                }
-//            }
-//
-//        }
-//    }
 
         //naive GEN KILL IN OUT
     void sGEN_sKILL_init() {
-        // std::vector<Value*> sGEN;
-        // std::unordered_map<Value*, std::set<Value*>> sKILL;
-        // std::unordered_map<Value*, std::set<Value*>> sVar2Def;
-        // std::unordered_map<Value*, std::set<Value*>> sBB_GEN;
-        // std::unordered_map<Value*, std::set<Value*>> sBB_KILL;
-        // std::unordered_map<Value *, std::set<Value*>> sBB_IN, sBB_OUT;
-        // std::unordered_map<Value *, std::set<Value*>> sIN, sOUT;
-
         sGEN.clear();
         sKILL.clear();
         sBB_GEN.clear();
@@ -395,8 +364,53 @@ struct CAT : public FunctionPass {
 
         ptr2Val.clear();
         val2Ptr.clear();
+        ptr2AliasPtrs.clear();
 
     }
+        Value * must_point2(Instruction * instr, Value * ptr) {
+            std::vector<Value *> vals;
+            for (auto &pv: mptIN[instr]) {
+                if (pv.first == ptr) {
+                    vals.push_back(pv.second);
+                }
+            }
+
+            if(vals.size() != 1) return NULL;
+
+            return vals[0];
+        }
+/**
+     *  Given call instruction on CAT_set, CAT_add, CAT_sub
+     *      find target of operation
+     * */
+        Value * get_define_target(CallInst * call_instr) {
+
+            Value * key = NULL;
+            Value * arg0 = call_instr->getArgOperand(0);
+            if (IS_CAT_new(get_callee_ptr(arg0)) ) {
+                /**
+                 *  First argument is a CAT_new call
+                 * */
+                key = arg0;
+
+            } else if (isa<PHINode>(arg0)) {
+                key = arg0;
+
+            } else if (isa<Argument>(arg0)) {
+                key = arg0;
+
+            } else if (isa<LoadInst>(arg0)) {
+                LoadInst * loadInst = cast<LoadInst>(arg0);
+                Value * ptr = loadInst->getPointerOperand();
+                Value * val = must_point2(call_instr, ptr);
+
+                key = val ? val : arg0;
+            }
+
+            return key;
+        }
+
+
     void findCATVar(Function &F){
             cat_var.clear();
             for(auto& inst:instructions(F)){
@@ -409,59 +423,21 @@ struct CAT : public FunctionPass {
                         int num = callInst->getNumArgOperands();
                         for(auto i = 0; i<num;i++){
                             Value *arg = callInst->getArgOperand(i);
-                            if(isa<PHINode>(arg))
-                                findCATVarHelper(arg);
-                            if(isa<CallInst>(arg))
-                                cat_var.insert(arg);
+                            cat_var.insert(arg);
                         }
                     }else
                     if(IS_CAT_set(callee)||IS_CAT_get(callee)){
                         Value *arg = callInst->getArgOperand(0);
-                        if(isa<PHINode>(arg))
-                            findCATVarHelper(arg);
                         cat_var.insert(arg);
                     }
 
                 }
             }
         }
-        void findCATVarHelper(Value *arg){
-            PHINode *phi = cast<PHINode>(arg);
-            uint32_t numIncoming = phi->getNumIncomingValues();
-            for(auto i=0;i<numIncoming;i++){
-             Value* arg = phi->getIncomingValue(i);
-             if(isa<PHINode>(arg))
-                 findCATVarHelper( arg);
-             if(isa<CallInst>(arg)){
-                 CallInst *callInst = cast<CallInst>(arg);
-                 Function *callee = callInst->getCalledFunction();
-                 if(IS_CAT_new(callee))
-                     cat_var.insert(arg);
-                 if(IS_CAT_add(callee)||IS_CAT_sub(callee)){
-                     int num = callInst->getNumArgOperands();
-                     for(auto i = 0; i<num;i++){
-                         Value *arg = callInst->getArgOperand(i);
-                         if(isa<PHINode>(arg))
-                             findCATVarHelper(arg);
-                         if(isa<CallInst>(arg))
-                             cat_var.insert(arg);
-                     }
-                 }else
-                 if(IS_CAT_set(callee)||IS_CAT_get(callee)){
-                     Value *arg = callInst->getArgOperand(0);
-                     if(isa<PHINode>(arg))
-                         findCATVarHelper(arg);
-                     cat_var.insert(arg);
-                 }
-             }
-
-            }
-        }
-
 
     void mptGEN_KILL(Function &F){
             findCATVar(F);
-            std::set<Value *> escapedVar;
+            std::set<Value *> allValue;
 
             // May-Point-To GEN
             for(auto &bb : F){
@@ -473,47 +449,23 @@ struct CAT : public FunctionPass {
                         // If p -> v
                         mptGEN[&inst].insert(std::make_pair(ptrOperand,valueStored));
                         ptr2Val[ptrOperand].insert(valueStored);
-//                        escapedVar.insert(valueStored);
-//                        if(IS_CAT_VAR(valueStored)){
-//                            mptGEN[&inst].insert(std::make_pair(ptrOperand,valueStored));
-//                            val2Ptr[valueStored].insert(ptrOperand);
-//                            ptr2Val[ptrOperand].insert(valueStored);
-//                            // this var may escape
-//                            // FIXME: or only function can escape this variable
-//                            escapedVar.insert(valueStored);
-//                        }else{
-//                            // p -> q
-//                            mptGEN[&inst].insert(std::make_pair(ptrOperand,valueStored));
-//                        }
-                        // If p -> q
-                        // do nothing, no GEN
+                        // store this v, this can be anything not only cat var
+                        allValue.insert(valueStored);
                     }
-                }
-            }
-            // Find escape var
-            for(auto& BB :F){
-                for(auto& inst:BB){
-                    /**
-                     *  Only when calling user defined function will a variable escape, mark that var
-                     *
-                     */
-                    if(isa<CallInst>(&inst)){
-                        CallInst *callInst = cast<CallInst>(&inst);
-                        Function *callee = callInst->getCalledFunction();
-                        if(IS_USER_FUNC(callee)){
-                            uint32_t num = callInst->getNumArgOperands();
-                            for(auto i=0;i<num;i++){
-                                Value * arg = callInst->getArgOperand(i);
-                                if(isa<PointerType>(arg->getType())){
-                                    Value *var = getVar(arg);
-                                    if(IS_CAT_VAR(var))
-                                        escapedVar.insert(var);
-                                }
-                            }
+
+                    // Store this and waiting to be killed further
+                    if(isa<SelectInst>(&inst)){
+                        SelectInst *selectInst = cast<SelectInst>(&inst);
+                        int num_arg = selectInst->getNumOperands();
+                        for(auto i=1;i<num_arg;i++){
+                            Value *aPtr = selectInst->getOperand(i);
+                            ptr2AliasPtrs[aPtr].insert(&inst);
+                            ptr2AliasPtrs[&inst].insert(aPtr);
                         }
                     }
                 }
             }
+
             // MPT KILL
             // KILL only if this ptr escaped
             for(auto &&bb : F){
@@ -523,25 +475,33 @@ struct CAT : public FunctionPass {
                         Value *valueStored = storeInst->getValueOperand();
                         Value *ptrOperand = storeInst->getPointerOperand();
                         // If p -> v, just insert every escaped var here
-                        if(IS_CAT_VAR(valueStored)){
-                            for(auto& e:escapedVar){
-                                // {(p,v)| v escaped}
-                                mptKILL[&inst].insert(std::make_pair(ptrOperand,e));
+                        // Kill all (p, cat_var), not matter what
+                        // because here we just redefine p so it does not matter
+                        // If SELECT INST, it is for sure they will be alias, e.g p = select 1 q r
+                        // then KILL all (p,x) (q,x) (r,x)
+                        for(auto& alias:ptr2AliasPtrs){
+                            if(IN_SET(alias.second,ptrOperand)){
+                                errs()<<"FIND:ALIAS "<< *alias.first<<"\n";
+                                // first
+                                for(auto& e:allValue){
+                                    mptKILL[&inst].insert(std::make_pair(alias.first,e));
+                                }
+                                //second
+                                for(auto& e:allValue){
+                                    for(auto& p:alias.second){
+                                        mptKILL[&inst].insert(std::make_pair(p,e));
+                                    }
+                                }
                             }
                         }
+
+                        // {(p,v)| v escaped}
+                        // Just simply kill all (p,v)
+                        for(auto& e:allValue){
+                            mptKILL[&inst].insert(std::make_pair(ptrOperand,e));
+                        }
+
                     }
-//                    if(isa<CallInst>(&inst)){
-//                     CallInst* callInst  = cast<CallInst>(&inst);
-//                     Function* callee = callInst->getCalledFunction();
-//                     // if escaped
-//                     if(IS_USER_FUNC(callee)){
-//                         uint32_t num_arg = callInst->getNumArgOperands();
-//                         for (uint32_t i = 0; i < num_arg; i++) {
-//                             Value * arg = callInst->getArgOperand(i);
-//                             mptKill(&inst,arg); //inst, p
-//                         }
-//                     }
-//                    }
                 }
             }
         }
@@ -554,6 +514,8 @@ struct CAT : public FunctionPass {
                 mptBB_IN[&BB] = std::set<std::pair<Value*,Value*>>();
                 mptBB_OUT[&BB] = std::set<std::pair<Value*,Value*>>();
             }
+
+
             bool changed;
             do{
                 changed = false;
@@ -568,6 +530,8 @@ struct CAT : public FunctionPass {
                     for(auto& inst:BB){
                         local_IN = local_OUT;
                         mptIN[&inst] = local_IN;
+
+
                         if(isa<StoreInst>(&inst)){
 
                             StoreInst *storeInst = cast<StoreInst>(&inst);
@@ -587,6 +551,104 @@ struct CAT : public FunctionPass {
                             local_OUT = out;
 
                         }
+
+                        //FIXME:
+                        // If store, remember the must alias table
+                        if(isa<LoadInst>(&inst)){
+                            errs()<<inst<<"\n";
+                            LoadInst* loadInst = cast<LoadInst>(&inst);
+                            Value* ptr = loadInst->getPointerOperand();
+                            // find if (loadRoot,x) in mptIN
+                            std::set<std::pair<Value*,Value*>> temp;
+                            for(auto& pr:mptIN[&inst]){
+                                //find
+                                if(ptr==pr.first){
+                                    temp.insert(pr);
+                                    errs()<<*pr.first<<" ,"<<*pr.second<<"\n";
+                                }
+                            }
+
+                            if(temp.size()==1){
+                                //(0,1)
+                                Value *t = temp.begin()->second;
+                                //(0,3) -> (3,1)
+                                mustAliasing[loadInst]=t;
+                            }else if(temp.size()==0){
+                                // If we can find the ptr in the mustAliasing
+                                if(mustAliasing.find(ptr)!=mustAliasing.end()){
+                                    //errs()<<"FIND";
+                                    // The size of it must be 1
+                                    Value* t = mustAliasing[ptr];
+                                    //
+
+                                    std::set<std::pair<Value*,Value*>> temp2;
+                                    for(auto& pr:mptIN[&inst]){
+                                        //find
+                                        if(t==pr.first){
+                                            temp2.insert(pr);
+                                        }
+                                    }
+                                    if(temp2.size()==0){
+                                        cat_var.insert(loadInst);
+                                        local_OUT.insert(std::make_pair(ptr,loadInst));
+                                    }else{
+                                        Value *t1 = temp2.begin()->second;
+                                        mustAliasing[loadInst]=t1;
+                                    }
+
+                                }else{
+                                    cat_var.insert(loadInst);
+                                    local_OUT.insert(std::make_pair(ptr,loadInst));
+                                }
+
+
+                            }
+
+                            if(!changed){
+                                changed = (local_OUT!=mptOUT[&inst]);
+                            }
+                        }
+
+
+                        if(isa<SelectInst>(&inst)){
+
+                           /*
+                            std::set<std::pair<Value*,Value*>> temp;
+                            for(int i=0;i<num_arg;i++){
+                                Value* q = selectInst->getOperand(i);
+                                for(auto& item:mptIN[&inst]){
+                                    if(item.first==q){
+                                        temp.insert(std::make_pair(&inst,item.second));
+                                    }
+                                }
+                            }
+
+                            std::set<std::pair<Value*,Value*>> all_x;
+                            for(auto& x:cat_var){
+                                all_x.insert(std::make_pair(&inst,x));
+                            }
+
+                            std::set<std::pair<Value*,Value*>> diff;
+
+                            set_diff(mptIN[&inst],all_x,diff);
+
+                            std::set<std::pair<Value*,Value*>> out;
+
+                            set_union(temp,diff,out);
+
+                            if(!changed){
+                                changed = (out!=mptOUT[&inst]);
+                            }
+                            local_OUT = out;
+                            errs()<<"SELECT INST\n";
+                            for(auto& item:out){
+
+                                errs()<<*item.first<<"  "<<*item.second<<"\n";
+                            }
+                            */
+                        }
+
+
                         mptOUT[&inst] = local_OUT;
                     }
                     mptBB_OUT[&BB]=local_OUT;
@@ -594,22 +656,8 @@ struct CAT : public FunctionPass {
 
             }while(changed);
 
+        }
 
-        }
-        Value* getVar(Value *arg){
-            if(IN_MAP(ptrToVal, arg)){
-                Value* next_arg = ptrToVal[arg];
-                return getVar(next_arg);
-            }
-            return arg;
-        }
-        void mptKill(Value *inst,Value *arg){
-            if (isa<PointerType>(arg->getType())) {
-                for(auto &val:ptr2Val[arg]){
-                    mptKILL[inst].insert(std::make_pair(arg,val));
-                }
-            }
-        }
 
     /**
      *  Expect arg to be a pointer 
@@ -680,8 +728,22 @@ struct CAT : public FunctionPass {
 
                             Value * arg0 = call_instr->getArgOperand(0);
                             key = arg0;
+                            if(isa<LoadInst>(arg0)){
+                                //Value *loadRoot = getLoadRoot(&inst, arg0);
+                                // replace this with the aliasing var
+                                key = getLoadCatVar(arg0);
+//                                std::set<Value*> loadLeaf;
+//                                //mptIN = (g,%2)(2,%4)
+//                                //errs()<<"LOADLEAF\n";
+//                                loadLeaf = getLoadLeaf(&inst, loadRoot);
+//                                //errs()<<"LOADLEAF-E\n";
+//                                if(loadLeaf.size()==1){
+//                                    //find %4
+//                                    auto alias = loadLeaf.begin();
+//                                   key = *alias;
+//                                }
+                            }
                         }
-
                         sVar2Def[key].insert(call_instr);
                     }
 
@@ -704,10 +766,7 @@ struct CAT : public FunctionPass {
                             ptr_trace_back(arg, possible_vals);
 
                             for (uint32_t j = 0; j < possible_vals.size(); j++) {
-                                // if(isa<Instruction>(possible_vals[j])){
-                                    // Instruction * memInst = cast<Instruction>(possible_vals[j]);
-                                    
-                                    // errs() << *memInst  << " at " << memInst << '\n'; 
+
                                     MemoryLocation memLoc(possible_vals[j]);
                                     ModRefInfo info = AA.getModRefInfo(call_instr, memLoc); 
 
@@ -749,7 +808,6 @@ struct CAT : public FunctionPass {
                 Value* ptrOperand = storeInst->getPointerOperand();
                 ptrToVal[ptrOperand] = valueStored;
             }
-
         }
 
 
@@ -773,6 +831,10 @@ struct CAT : public FunctionPass {
                             // get first operand if CAT_set, CAT_add, CAT_sub
                             Value * arg0 = call_instr->getArgOperand(0);
                             key = arg0;
+                            if(isa<LoadInst>(arg0)){
+                                Value *loadRoot = getLoadRoot(call_instr, arg0);
+                                key = getLoadCatVar(arg0);
+                            }
                         }
 
                         sKILL[gen] =  sVar2Def[key];
@@ -1870,30 +1932,80 @@ struct CAT : public FunctionPass {
     bool check_constant_AA_wrap(AliasAnalysis & AA, Instruction * instr, Value * arg, int64_t * res) {
         std::vector<Value *> aliases;
         aliases.push_back(arg);
-        
+        bool mustAlias = false;
         for (auto & cat_var : CAT_new_collect) {
             if (cat_var != arg){
                 AliasResult AAResult = AA.alias(cat_var, arg);
                 if (AAResult == AliasResult::MustAlias) {
                     errs() << *arg << " at " << arg << " alias with " << *cat_var << " at " << cat_var << '\n';
+                    mustAlias = true;
                     aliases.push_back(cat_var);
                 }
             }
             
         }
+        int64_t temp_val;
+        if(!mustAlias){
+            // Check IN OUT of this inst
+
+            if(isa<LoadInst>(arg)){
+                if(check_constant_s(instr, getLoadCatVar(arg), &temp_val)) {
+                    *res = temp_val;
+                    return true;
+                }
+            }
+        }
 
         /**
          * If one alias is sure to be constant we should be good to propogate
          * */
-        int64_t temp_val;
+
         for (uint32_t i = 0; i < aliases.size(); i++) {
             if(check_constant_s(instr, aliases[i], &temp_val)) {
                 *res = temp_val;
                 return true;
             }
         }
-
         return false;
+    }
+    // get @g, the root pointer
+    Value* getLoadRoot(Instruction *instr, Value* arg){
+        LoadInst *loadInst = cast<LoadInst>(arg);
+        Value* ptr = loadInst->getPointerOperand();
+        if(isa<LoadInst>(ptr)){
+            return getLoadRoot(loadInst, ptr);
+        }
+        return ptr;
+    }
+
+    // get the root var this thing point to
+    Value* getLoadCatVar(Value* arg){
+        if(mustAliasing.find(arg)!=mustAliasing.end())
+            return getLoadCatVar(mustAliasing[arg]);
+            return arg;
+    }
+    std::set<Value*> getLoadLeaf(Instruction* instr, Value* loadRoot){
+
+        std::set<Value*> leaf;
+        leaf.clear();
+        for(auto& item : mptIN[instr]){
+            //errs()<<*item.first<<"\n";
+            if(loadRoot==item.first){
+                std::set<Value*> temp;
+                temp = getLoadLeaf(instr, item.second);
+                if(temp.size() == 0){
+                    //errs()<<"LOOOOOL:"<<*item.second;
+                    temp.insert(item.second);
+                    return temp;
+                }else{
+                    std::set<Value*> temp2;
+                    set_union(leaf,temp,temp2);
+                    leaf = temp2;
+                }
+            }
+        }
+        //errs()<<"Returning:";
+        return leaf;
     }
 
     bool check_constant_s(Instruction * instr, Value * arg, int64_t * res) {
