@@ -318,7 +318,7 @@ struct CAT : public FunctionPass {
         AliasAnalysis & AA = getAnalysis<AAResultsWrapperPass>().getAAResults();
         
         sGEN_sKILL_init();
-        mptGEN_KILL(F);
+        mptGEN_KILL(F, AA);
         mptIN_OUT(F);
         print_mpt_GENKILL(F);
         print_mpt_INOUT(F);
@@ -339,7 +339,7 @@ struct CAT : public FunctionPass {
         constant_folding(F, AA);
 
         sGEN_sKILL_init();
-        mptGEN_KILL(F);
+        mptGEN_KILL(F, AA);
         mptIN_OUT(F);
         print_mpt_GENKILL(F);
         print_mpt_INOUT(F);
