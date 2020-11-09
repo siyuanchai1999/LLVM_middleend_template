@@ -330,7 +330,7 @@ struct CAT : public FunctionPass {
         //findCatVariables(F);
         //phi_node_new2set(F);
         AliasAnalysis & AA = getAnalysis<AAResultsWrapperPass>().getAAResults();
-        
+        findCATVar(F);
         sGEN_sKILL_init();
         mptGEN_KILL(F);
         mptIN_OUT(F);
@@ -481,60 +481,6 @@ struct CAT : public FunctionPass {
             }
         }
 
-        // Find escape var
-//         for(auto& BB :F){
-//             for(auto& inst:BB){
-//                 /**
-//                  *  Only when calling user defined function will a variable escape, mark that var
-//                  *
-//                  */
-//                 if(isa<CallInst>(&inst)){
-//                     CallInst *callInst = cast<CallInst>(&inst);
-//                     Function *callee = callInst->getCalledFunction();
-//                     if(IS_USER_FUNC(callee)){
-//                         uint32_t num = callInst->getNumArgOperands();
-//                         for(auto i=0;i<num;i++){
-//                             Value * arg = callInst->getArgOperand(i);
-//                             if(isa<PointerType>(arg->getType())){
-//                                 Value *var = getVar(arg);
-//                                 if(IS_CAT_VAR(var))
-//                                     escapedVar.insert(var);
-//                             }
-//                         }
-//                     }
-//                 }
-//             }
-//         }
-//         // MPT KILL
-//         // KILL only if this ptr escaped
-//         for(auto &&bb : F){
-//             for(auto &inst: bb){
-//                 if(isa<StoreInst>(&inst)){
-//                     StoreInst *storeInst = cast<StoreInst>(&inst);
-//                     Value *valueStored = storeInst->getValueOperand();
-//                     Value *ptrOperand = storeInst->getPointerOperand();
-//                     // If p -> v, just insert every escaped var here
-//                     if(IS_CAT_VAR(valueStored)){
-//                         for(auto& e:escapedVar){
-//                             // {(p,v)| v escaped}
-//                             mptKILL[&inst].insert(std::make_pair(ptrOperand,e));
-//                         }
-//                     }
-//                 }
-// //                    if(isa<CallInst>(&inst)){
-// //                     CallInst* callInst  = cast<CallInst>(&inst);
-// //                     Function* callee = callInst->getCalledFunction();
-// //                     // if escaped
-// //                     if(IS_USER_FUNC(callee)){
-// //                         uint32_t num_arg = callInst->getNumArgOperands();
-// //                         for (uint32_t i = 0; i < num_arg; i++) {
-// //                             Value * arg = callInst->getArgOperand(i);
-// //                             mptKill(&inst,arg); //inst, p
-// //                         }
-// //                     }
-// //                    }
-//             }
-//         }
     }
 
     /**
@@ -670,6 +616,32 @@ struct CAT : public FunctionPass {
             }
         }
     }
+
+    void findCATVar(Function &F){
+        cat_var.clear();
+        for(auto& inst:instructions(F)){
+            if(isa<CallInst>(&inst)){
+                CallInst *callInst = cast<CallInst>(&inst);
+                Function *callee = callInst->getCalledFunction();
+                if(IS_CAT_new(callee)){
+                    cat_var.insert(&inst);
+                } else if(IS_CAT_add(callee)||IS_CAT_sub(callee)){
+
+                    int num = callInst->getNumArgOperands();
+                    for(auto i = 0; i<num;i++){
+                        Value *arg = callInst->getArgOperand(i);
+                        cat_var.insert(arg);
+                    }
+
+                }else if(IS_CAT_set(callee)||IS_CAT_get(callee)){
+                    Value *arg = callInst->getArgOperand(0);
+                    cat_var.insert(arg);
+                }
+
+            }
+        }
+    }
+
         
     /**
      *  Expect arg to be a pointer 
@@ -2043,6 +2015,25 @@ struct CAT : public FunctionPass {
         return vals[0];
     }
 
+    AliasResult CAT_Alias(AliasAnalysis & AA, Value * valA, Value * valB) {
+        AliasResult AAResult = AA.alias(valA, valB);  
+        
+        // Strong enough
+        if (AAResult == AliasResult::MustAlias){
+            return AAResult;
+        }
+
+        if (isa<LoadInst>(valA) && isa<LoadInst>(valB)) {
+            LoadInst * loadA = cast<LoadInst>(valA);
+            LoadInst * loadB = cast<LoadInst>(valB);
+
+            if (loadA->getPointerOperand() == loadB->getPointerOperand()) {
+                return AliasResult::MustAlias;
+            }
+        }
+        return AAResult;
+    }
+
     /**
      *  Wrapper with AliasAnalysis.
      *  If we arg MUST Alias with some CAT_var, we are same to claim it's constant
@@ -2053,15 +2044,15 @@ struct CAT : public FunctionPass {
         std::vector<Value *> aliases;
         aliases.push_back(arg);
         
-        for (auto & cat_var : CAT_new_collect) {
-            if (cat_var != arg){
-                AliasResult AAResult = AA.alias(cat_var, arg);
+        for (auto & var : cat_var) {
+            if (var != arg){
+                AliasResult AAResult = CAT_Alias(AA, var, arg);
 
                 errs() << "At instruction : " << *instr; 
-                errs() << *arg << " at " << arg << " alias with " << *cat_var << " at " << cat_var;
+                errs() << *arg << " at " << arg << " alias with " << *var << " at " << var;
                 errs() << " with result = " << AliasResult_toString(AAResult) << '\n';
                 if (AAResult == AliasResult::MustAlias) {
-                    aliases.push_back(cat_var);
+                    aliases.push_back(var);
                 }
             }
             
