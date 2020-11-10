@@ -259,11 +259,6 @@ struct CAT : public FunctionPass {
 
         };
 
-    // deadcode elimination
-    std::unordered_map<llvm::Instruction *, llvm::BitVector> live_GEN_INST, live_KILL_INST;
-    std::unordered_map<llvm::Instruction *, llvm::BitVector> live_IN_INST, live_OUT_INST;
-    std::unordered_map<llvm::BasicBlock *, llvm::BitVector> live_GEN_BB, live_KILL_BB;
-    std::unordered_map<llvm::BasicBlock *, llvm::BitVector> live_IN_BB, live_OUT_BB;
         // class to represent a disjoint set
         CAT() : FunctionPass(ID) {}
 
@@ -320,8 +315,6 @@ struct CAT : public FunctionPass {
         sGEN_sKILL_init();
         mptGEN_KILL(F, AA);
         mptIN_OUT(F);
-        print_mpt_GENKILL(F);
-        print_mpt_INOUT(F);
 
         build_store_table(F);
 
@@ -341,8 +334,6 @@ struct CAT : public FunctionPass {
         sGEN_sKILL_init();
         mptGEN_KILL(F, AA);
         mptIN_OUT(F);
-        print_mpt_GENKILL(F);
-        print_mpt_INOUT(F);
 
         build_store_table(F);
 
@@ -351,7 +342,6 @@ struct CAT : public FunctionPass {
         sIN_sOUT(F);
         sIN_OUT_inst(F);
         constant_propagation(F, AA);
-    //    constant_propagation(F);
         return false;
     }
 
@@ -394,26 +384,39 @@ struct CAT : public FunctionPass {
     }
     
 
-    void select_trace_back(SelectInst * select, std::vector<Value *> & res) {
+    void select_trace_back(Value * val, std::vector<Value *> & res) {
+        res.push_back(val);
+        if (!isa<SelectInst>(val)) return;
+
+        SelectInst * select = cast<SelectInst>(val);
+
         Value * op1 = select->getOperand(1);
         Value * op2 = select->getOperand(2);
 
-        if (isa<SelectInst>(op1)) {
-            select_trace_back(cast<SelectInst>(op1), res);
-        }
-
-        if (isa<SelectInst>(op2)) {
-            select_trace_back(cast<SelectInst>(op2), res);
-        }
-
         res.push_back(op1);
         res.push_back(op2);
+
+        select_trace_back(op1, res);
+        select_trace_back(op2, res);
     }
- 
+
+    void __complete_pairs(Value * ptr, std::vector<std::pair<Value *, Value *>> & points_to_all) {
+        points_to_all = std::vector<std::pair<Value *, Value *>>(cat_var.size());
+
+        uint32_t idx = 0;
+        for (Value * var: cat_var) {
+            points_to_all[idx++] = std::make_pair(ptr, var);
+        }
+    }
+    
+    void ptr_GEN_KILL(Function &F, AliasAnalysis & AA) {
+
+    }
+
     void mptGEN_KILL(Function &F, AliasAnalysis & AA){
         findCATVar(F);
-        std::set<Value *> escapedVar;
 
+        std::unordered_map<Value *,std::set< Value *>> mpt_gen2ptr;
         // May-Point-To GEN
         for(auto &bb : F){
             for(auto &inst: bb){
@@ -422,50 +425,78 @@ struct CAT : public FunctionPass {
                     Value *valueStored = storeInst->getValueOperand();
                     Value *ptrOperand = storeInst->getPointerOperand();
                     // If p -> v
-                    mptGEN[&inst].insert(std::make_pair(ptrOperand,valueStored));
-                    ptr2Val[ptrOperand].insert(valueStored);
+                    /**
+                     *  %10 = select i1 %9, i8** %3, i8** %4
+                     *  store i8* %11, i8** %10, align 8, !tbaa !2
+                     *      only %10 is the real pointer being strongly defined here
+                     *      we need to gen pairs including %3 or %4, but only pairs involving %10 should be killed later 
+                     * */
+                    mpt_gen2ptr[&inst].insert(ptrOperand);
 
-                    if (isa<SelectInst>(ptrOperand)) {
-                        std::vector<Value *> select_res;
 
-                        select_trace_back(cast<SelectInst>(ptrOperand), select_res);
+                    std::vector<Value *> ptr_collect;
+                    std::vector<Value *> value_collect;
 
-                        for (Value * ptr : select_res) {
-                            mptGEN[&inst].insert(std::make_pair(ptr, valueStored));
+                    select_trace_back(ptrOperand, ptr_collect);
+                    select_trace_back(valueStored, value_collect);
+                    
+                    for (Value * ptr : ptr_collect) {
+                        for (Value * val : value_collect) {
+                            
+                            mptGEN[&inst].insert(std::make_pair(ptr, val));
+                            
+                            ptr2Val[ptr].insert(val);
                         }
                     }
+
                     
-                } 
-                // else if (isa<CallInst>(&inst)) {
-                //     CallInst * call_instr = cast<CallInst>(&inst);
-                //     Function * callee_ptr = call_instr->getCalledFunction();
+                } else if (isa<CallInst>(&inst)) {
+                    CallInst * call_instr = cast<CallInst>(&inst);
+                    Function * callee_ptr = call_instr->getCalledFunction();
 
-                //     if (IS_CAT_OP(callee_ptr)) {
-                //         /**
-                //          *  Do nothing. CAT operation never changes point-to analysis
-                //          * */
-                //     } else if (IS_USER_FUNC(callee_ptr)) {
-                //         uint32_t num_arg = call_instr->getNumArgOperands();
-                //         for (uint32_t i = 0; i < num_arg; i++) {
-                //             Value * arg = call_instr->getArgOperand(i);
+                    if (IS_CAT_OP(callee_ptr)) {
+                        /**
+                         *  Do nothing. CAT operation never changes point-to analysis
+                         * */
+                    } else if (IS_USER_FUNC(callee_ptr)) {
+                        uint32_t num_arg = call_instr->getNumArgOperands();
+                        for (uint32_t i = 0; i < num_arg; i++) {
+                            Value * arg = call_instr->getArgOperand(i);
 
-                //             if (IS_PTR_TYPE(arg) && !IS_CAT_VAR(arg) ) {
-                //                 /**
-                //                  *  This is a pointer but not a CAT variable
-                //                  *      This has the suspicion of being a pointer to CAT variable
-                //                  * */
-                //                 ModRefInfo ModRefResult = AA.getArgModRefInfo(call_instr, i);
-                //                 if (HAS_MOD(ModRefResult)) {
+                            if (IS_PTR_TYPE(arg) && !IS_CAT_VAR(arg) ) {
+                                /**
+                                 *  This is a pointer but not a CAT variable
+                                 *      This has the suspicion of being a pointer to CAT variable
+                                 * */
+                                ModRefInfo ModRefResult = AA.getArgModRefInfo(call_instr, i);
+                                errs() << " MPT user function: " << inst << " , arg = " << *arg << " ModRefResult = " << ModRefInfo_toString(ModRefResult) << '\n';
+                                if (HAS_MOD(ModRefResult)) {
+                                    /**
+                                     *  If the pointer is modified
+                                     *      we don't have info about where it points to 
+                                     *      To be conservative, we say it points to everything and 
+                                     * */
+                                    Value * dummy = build_constint(0);
+                                    
 
-                //                 }
-                //             }
-                //         }
-                //     } else {
-                //         /**
-                //          *  Do nothing. standard lib function
-                //          * */
-                //     }
-                // }
+                                    mptGEN[&inst].insert(
+                                        std::make_pair(arg, dummy)
+                                    );
+                                    mpt_gen2ptr[&inst].insert(arg);
+                                    
+                                    /**
+                                     *  As we don't know which it points to, create dummy const
+                                     * */
+                                    ptr2Val[arg].insert(dummy);
+                                }
+                            }
+                        }
+                    } else {
+                        /**
+                         *  Do nothing. standard lib function
+                         * */
+                    }
+                }
             }
         }
 
@@ -475,22 +506,18 @@ struct CAT : public FunctionPass {
          * */
         for (auto & kv : mptGEN) {
             // kv : [store inst, set<(p, v) pairs>]
-            StoreInst * storeInst = cast<StoreInst>(kv.first);
-            Value * ptr = storeInst->getPointerOperand();
-
-            // for (Value * val : ptr2Val[ptr]) {
-            //     mptKILL[storeInst].insert(
-            //         std::make_pair(ptr, val)
-            //     );
-            // }
-
-            for (Value * var: cat_var) {
-                mptKILL[storeInst].insert(
-                    std::make_pair(ptr, var)
-                );
+            // StoreInst * storeInst = cast<StoreInst>(kv.first);
+            for (Value * ptr : mpt_gen2ptr[kv.first]){
+                for (Value * val : ptr2Val[ptr]) {
+                    mptKILL[kv.first].insert(
+                        std::make_pair(ptr, val)
+                    );
+                }
             }
+            
         }
-
+        
+         
     }
 
     /**
@@ -501,7 +528,7 @@ struct CAT : public FunctionPass {
         Instruction * inst
     ){
         std::set<std::pair<Value*,Value*>> tempOut;
-        if (isa<StoreInst>(inst)) {
+        if (isa<StoreInst>(inst) ) {
             /**
              *  p = &x;
              *  OUT[i] = GEN[i] U (IN[i] – KILL[i])
@@ -551,6 +578,31 @@ struct CAT : public FunctionPass {
             }
 
             tempOut.insert(inMinusKill.begin(), inMinusKill.end());
+
+        } else if (isa<CallInst>(inst)) {
+            Function * fptr = get_callee_ptr(inst);
+            if (IS_USER_FUNC(fptr)) {
+                /**
+                 *  OUT[i] = GEN[i] U (IN[i] – KILL[i])
+                 * */
+                std::set<std::pair<Value*,Value*>> inMinusKill;
+                set_diff(
+                    mptIN[inst],
+                    mptKILL[inst], 
+                    inMinusKill
+                );
+
+                set_union(
+                    inMinusKill,
+                    mptGEN[inst], 
+                    tempOut
+                );
+            } else {
+                /**
+                 *  CAT op and other funcionts, do nothign
+                 * */
+                tempOut = mptIN[inst];
+            }
         } else {
             /**
              *  Other type of instructions??
@@ -1405,454 +1457,6 @@ struct CAT : public FunctionPass {
         }
     }
 
-    void find_escaped(Function & F) {
-        for (BasicBlock &bb : F){
-            for(Instruction &inst : bb){
-                Function * callee_fptr = get_callee_ptr(&inst);
-                if (callee_fptr != NULL && !IS_CAT_OP(callee_fptr)) {
-                    CallInst * callinstr = cast<CallInst>(&inst);
-                    uint32_t arg_num = callinstr->getNumArgOperands();
-
-                    for (uint32_t i = 0; i < arg_num; i++){
-                        Value * arg = callinstr->getArgOperand(i);
-                        std::vector<CallInst *> sub_escape;
-                        if (get_CATvar_fromArg(arg, sub_escape)) {
-                            escaped.insert(sub_escape.begin(), sub_escape.end());
-                        }
-                    }
-                }
-            }
-        }
-        
-        errs() << escaped.size() << "  escaped var in " << F.getName().str() <<'\n';
-        for ( auto it = escaped.begin(); it != escaped.end(); ++it ){
-            errs() << **it <<'\n';
-        }
-    }
-
-    bool get_CATvar_fromArg(Value * arg, std::vector<CallInst *> & sub_escape){
-        if (isa<PHINode>(arg)){
-            PHINode * phi = cast<PHINode>(arg);
-            uint32_t numIncoming = phi->getNumIncomingValues();
-            bool found = false;
-
-            for (uint32_t i = 0; i < numIncoming; i++) {
-                Value * inValue = phi->getIncomingValue(i);
-                if (get_CATvar_fromArg(inValue, sub_escape)) {
-                    found = true;
-                }
-            }
-
-            return found;            
-        }
-
-        if (IN_STORE_TABLE(arg)){
-            bool found = false;
-            for (auto it = store_table[arg].begin(); it != store_table[arg].end(); it++){
-                if(get_CATvar_fromArg(*it,sub_escape)){
-                    found = true;
-                }
-            }
-            return found;    
-        }
-
-        if (isa<CallInst>(arg)){
-            CallInst * call_instr = cast<CallInst>(arg);
-            Function * fptr = call_instr->getCalledFunction();
-            // what about others?
-            sub_escape.push_back(call_instr);
-            if (IS_CAT_new(fptr)) return true;
-        }
-
-        return false;
-    }
-    
-    /**
-     * visited_phi[phi] returns a set of CAT_new under such phi
-     * */
-    int count_CAT_new_under_Phi(
-        PHINode * phi, 
-        std::map<PHINode *, std::set<Value *>> & visited_phi
-    ) {
-        errs() << "counting for " << *phi << '\n';
-        if (IN_SET(visited_phi, phi)){
-            return visited_phi[phi].size();
-        }
-
-        uint32_t numIncoming = phi->getNumIncomingValues();
-        int cat_new_num = 0;
-        visited_phi[phi] = std::set<Value *>();
-
-        for (uint32_t i = 0; i < numIncoming; i++) {
-            Value * inValue = phi->getIncomingValue(i);
-            
-            if(Function * fptr = get_callee_ptr(inValue)){
-                if (IS_CAT_new(fptr)){
-                    CallInst * call_instr = cast<CallInst>(inValue);
-                    visited_phi[phi].insert(call_instr);
-                    cat_new_num++;
-                }
-
-            } else if(isa<PHINode>(inValue)){
-                PHINode * child_phi = cast<PHINode>(inValue);
-                
-                count_CAT_new_under_Phi(
-                    child_phi,
-                    visited_phi
-                );
-
-                cat_new_num += visited_phi[child_phi].size();
-                visited_phi[phi].insert(
-                    visited_phi[child_phi].begin(),
-                    visited_phi[child_phi].end()
-                );
-
-            } else if(isa<Argument>(inValue)&&!isa<ConstantInt>(inValue)){
-                Argument *arg = cast<Argument>(inValue);
-                cat_arg.insert(arg);
-                visited_phi[phi].insert(arg);
-                cat_new_num++;
-            }
-        }
-
-        return cat_new_num;
-    }
-
-    void add_edge(
-        std::map<llvm::Value *, std::set<llvm::Value *>> &graph,
-        llvm::Value * val_a,
-        llvm::Value * val_b
-    ) {
-        if (!IN_MAP(graph, val_a)){
-            graph[val_a] = std::set<llvm::Value *>();
-        }
-
-        if (!IN_MAP(graph, val_b)){
-            graph[val_b] = std::set<llvm::Value *>();
-        }
-
-        graph[val_a].insert(val_b);
-        graph[val_b].insert(val_a);
-
-    }
-
-    void add_edge_group(
-        std::map<llvm::Value *, std::set<llvm::Value *>> &graph,
-        // PHINode * phi,
-        std::set<Value *> & cat_news
-    ){  
-        std::vector<Value *> cat_new_vec(cat_news.begin(), cat_news.end());
-
-        // for(uint32_t i = 0; i < cat_new_vec.size(); i++){
-        //     for(uint32_t j = i + 1; j < cat_new_vec.size(); j++){
-        //         add_edge(
-        //             graph,
-        //             cat_new_vec[i],
-        //             cat_new_vec[j],
-        //             phi
-        //         );
-        //     }
-        // }
-        for(uint32_t i = 1; i < cat_new_vec.size() ; i++){
-            add_edge(
-                graph,
-                cat_new_vec[i],
-                cat_new_vec[i - 1]
-            );
-        }
-    }
-
-    void DFS(
-        std::map<llvm::Value *, std::set<llvm::Value *>> &graph,
-        std::set<llvm::Value *> & visited,
-        llvm::Value * val_node,
-        std::vector<llvm::Value *> & CC_sub
-        // std::set<llvm::Value *> & CC_edge_sub
-    ) {
-        for (auto & ngbr : graph[val_node]) {
-            if(!IN_SET(visited, ngbr)){
-                
-                visited.insert(ngbr);
-                CC_sub.push_back(ngbr);
-                // CC_edge_sub.insert(kv.second);
-
-                DFS(
-                    graph,
-                    visited,
-                    ngbr,
-                    CC_sub
-                    // CC_edge_sub
-                );
-            }
-        }
-    }
-    
-    void connected_components(
-        std::map<llvm::Value *, std::set<llvm::Value *>> &graph,
-        std::vector<std::vector<llvm::Value *>> & CC
-        // std::vector<std::set<llvm::Value *>> & CC_edge
-    ) {
-        std::set<llvm::Value *> visited;
-        for (auto &kv : graph){
-            if(!IN_SET(visited, kv.first)){
-
-                visited.insert(kv.first);
-                std::vector<llvm::Value *> CC_sub;
-                CC_sub.push_back(kv.first);
-
-                // std::set<llvm::Value *> CC_edge_sub;
-
-                DFS(
-                    graph,
-                    visited,
-                    kv.first,
-                    CC_sub
-                    // CC_edge_sub
-                );
-
-                CC.push_back(CC_sub);
-                // CC_edge.push_back(CC_edge_sub);
-            }
-        }
-    }
-
-    void print_CC(
-        std::vector<std::vector<llvm::Value *>> &CC
-        // std::vector<std::set<llvm::Value *>> & CC_edge
-    ){
-        errs() <<"printing CC\n";
-        for(uint32_t i = 0; i < CC.size(); i++){
-            errs() <<"#" << i << " CC\n";
-            for(uint32_t j = 0; j < CC[i].size(); j++){
-                errs() << *CC[i][j] <<'\n';
-            }
-
-            // errs() <<"Connected over\n";
-            // for (auto it = CC_edge[i].begin(); it != CC_edge[i].end(); it++){
-            //     errs() << **it <<'\n';
-            // }
-
-             errs() <<'\n';
-
-        }
-    }
-
-
-    void print_phi_info(std::map<PHINode *, std::set<Value *>> &visited_phi){
-        errs() <<"printing kv info\n" ;
-        for (auto & kv : visited_phi){
-            errs() << "Phi node: " << *kv.first <<'\n';
-            for (auto &v : kv.second){
-                errs()  << *v <<'\n';
-            }
-        }
-    }
-
-
-    void replace_instr_val(Instruction * instr, Value * val){
-        BasicBlock::iterator ii(instr);
-        BasicBlock * bb = instr->getParent();
-        ReplaceInstWithValue(bb->getInstList(), ii, val);
-    }
-
-    /**
-     * replace body with head
-     * */
-    void CAT_new_to_CAT_set(
-        llvm::Value * CAT_new_old,
-        llvm::Value * CAT_new_replace
-    ) {
-        CallInst *old = cast<CallInst>(CAT_new_old);
-        IRBuilder<> builder(old);
-
-        Value * val = old->getArgOperand(0);
-        
-        ArrayRef<Value *> arg_arr_ref = ArrayRef<Value *>{CAT_new_replace, val};
-
-        Value * added_set_instr = builder.CreateCall(CAT_set_ptr, arg_arr_ref);
-        
-        // replacement
-        replace_instr_val(old, CAT_new_replace);
-    }
-    
-
-    /**
-     * Create dummy CAT_new at the beginning of the Function
-     * */
-    CallInst * build_CAT_new_Head(Function & F){
-        Instruction * first_instr = &(*instructions(F).begin());
-        IRBuilder<> builder(first_instr);
-
-        Constant * zeroConst = ConstantInt::get(IntegerType::get(currentModule->getContext(), 64), 0, true);
-        // std::vector<Value *> arg_vec{zeroConst};
-        ArrayRef<Value *> arg_arr_ref = ArrayRef<Value *>{zeroConst};
-
-        Value * added_new_instr = builder.CreateCall(CAT_new_ptr, arg_arr_ref);
-        return cast<CallInst>(added_new_instr);
-
-    }
-
-    void merge_Phi_CAT_new(
-        Function & F,
-        std::vector<llvm::Value *> & nodes
-        // std::set<llvm::Value *> & edges
-    ){
-        /**
-         * expect nodes to be all CallInstr on CAT_new
-         * expect edges to be all phi node phi that connects CAT_new 
-         * */
-        std::set<llvm::Value *> nodes_set(nodes.begin(), nodes.end());
-
-        Value * CAT_new_replace = NULL;
-
-        // Need fix if we add dummy block for argument???
-        
-        // find first instruction in the first basic block in the set of Cat_new to be merged
-        errs()<<"BEFORE\n";
-        for(auto arg=F.arg_begin();arg!=F.arg_end();++arg){
-            if(IN_SET(nodes_set, arg)){
-                errs()<<"FOUND"<<*arg<<"\n";
-                CAT_new_replace = cast<Value>(arg);
-                break;
-            }
-        }
-        for(Instruction & inst: F.getBasicBlockList().front()){
-            if(IN_SET(nodes_set, &inst)){
-                CAT_new_replace = cast<Value> (&inst);
-                break;
-            }
-        }
-
-        // if there's no such CAT_new, create a dummy one
-        if (CAT_new_replace == NULL) CAT_new_replace = build_CAT_new_Head(F);
-
-        for (uint32_t i = 0; i < nodes.size(); i++) {
-            Value * CAT_new_old = cast<Value>(nodes[i]);
-
-            if (CAT_new_old != CAT_new_replace){
-                CAT_new_to_CAT_set(
-                    CAT_new_old,
-                    CAT_new_replace
-                );
-            }
-            
-        }
-        errs()<<"AFTER\n";
-        // for (auto it = edges.begin(); it != edges.end(); it++){
-        //     PHINode * phi = cast<PHINode>(*it);
-        //     replace_instr_val(phi, CAT_new_replace);
-        // }
-        
-    }
-
-    bool merge_single_phi(PHINode *phi) {
-        // errs() << "replacing" << *phi  << "at " << phi << '\n';
-        uint32_t numIncoming = phi->getNumIncomingValues();
-
-        std::vector<Value *> inValue_collect(numIncoming);
-        for (uint32_t i = 0; i < numIncoming; i++) {
-            inValue_collect[i] = phi->getIncomingValue(i);                   
-        }
-
-        if (vec_all_equal(inValue_collect)){
-            replace_instr_val(phi, inValue_collect[0]);
-            // errs() <<"after replacement\n";
-            // errs() << phi << '\n';
-            return true;
-        }
-        
-        return false;
-    }
-
-    void merge_Phi(
-        std::map<PHINode *, std::set<Value *>> &visited_phi
-    ){  
-        std::set<PHINode *> worklist;
-        bool merged_in_round = true;
-
-        for (auto & kv : visited_phi){
-            worklist.insert(kv.first);
-        }
-
-        while (merged_in_round && !worklist.empty())
-        {
-            // create temp as it's hard to erase while iterating
-            std::set<PHINode *> worklist_temp = worklist;
-            merged_in_round = false;
-
-            for (auto & phi : worklist_temp){
-                bool merged = merge_single_phi(phi);
-
-                if (merged){
-                    
-                    worklist_temp.erase(phi);
-                }
-                merged_in_round = merged_in_round || merged;
-            }
-
-            worklist = worklist_temp;
-        }
-        
-    }
-    /**
-     * Go through the function, find all CAT_new linked by Phi node
-     * */
-    void phi_node_new2set(Function & F){
-        // std::unordered_map<PHINode *, std::vector<Value *>> to_merge;
-
-        // graph[cat_new1][cat_new2] -> phi node that connects them
-        errs() << "new2set for Function :" << F.getName().str() << '\n';
-        std::map<llvm::Value *, std::set<llvm::Value *>> graph;
-
-        std::map<PHINode *, std::set<Value *>> visited_phi;
-
-        for (BasicBlock &bb : F){
-            for(Instruction &inst : bb){
-                if (isa<PHINode>(&inst)){
-                    PHINode * phi = cast<PHINode>(&inst);
-                    
-                    if(!IN_SET(visited_phi, phi)){
-                        errs() << "analyzing " << *phi << '\n';
-                        int cnt = count_CAT_new_under_Phi(phi, visited_phi);
-                        errs() << "get cnt = " << cnt << '\n';
-                        if (cnt >= 2) {
-                            add_edge_group(
-                                graph,
-                                visited_phi[phi]
-                            );
-                        }
-                    }
-                }   
-            }
-        }
-
-        errs() << "fine before CC\n";
-        std::vector<std::vector<llvm::Value *>> CC;
-        // std::vector<std::set<llvm::Value *>> CC_edge;
-        connected_components(
-            graph,
-            CC
-            // CC_edge
-        );
-
-        print_CC(CC);
-        print_phi_info(visited_phi);
-
-        errs() << "fine before merge\n";
-        for (uint32_t i = 0; i < CC.size(); i++){
-            merge_Phi_CAT_new(
-                F,
-                CC[i]
-            );
-        }
-        
-        // for(auto & kv: to_merge){
-        //     merge_phi_and_new(kv.first, kv.second);
-        // }
-        merge_Phi(visited_phi);
-    }
-
-    
     // return the callee fptr if inst_ptr is call function
     Function * get_callee_ptr(Value * inst_ptr) {
         if (isa<CallInst>(inst_ptr)){
@@ -2021,11 +1625,21 @@ struct CAT : public FunctionPass {
             LoadInst * loadB = cast<LoadInst>(valB);
             Value * ptrA = loadA->getPointerOperand();
             Value * ptrB = loadB->getPointerOperand();
-
+            
+            errs() << *ptrA << " and " << *ptrB << " alias with result = " << AliasResult_toString(AAResult) << '\n';
             if (ptrA == ptrB) {
+                /**
+                 *  if ptrA == ptrB or ptrA mustAlias ptrB
+                 *      if mptIN[loadA][ptrA] == mptIN[loadB][ptrB] -> two load are the same
+                 *          return mustAlias
+                 * 
+
+                 * */
+                AliasResult AAResult  = AA.alias(ptrA, ptrB);
+                
                 std::vector<std::pair<Value *, Value *>> pv_pairA, pv_pairB;
                 mpt_ptr_selection(loadA, ptrA, pv_pairA);
-                mpt_ptr_selection(loadA, ptrA, pv_pairB);
+                mpt_ptr_selection(loadB, ptrB, pv_pairB);
 
                 if (vec_is_equal(pv_pairA, pv_pairB)){
                     return AliasResult::MustAlias;
