@@ -18,6 +18,8 @@
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/Analysis/AliasAnalysis.h"
+#include "llvm/Transforms/Utils/Cloning.h"
+
 #include <set>
 #include <unordered_set>
 #include <vector>
@@ -98,13 +100,10 @@ struct CAT : public FunctionPass {
     std::unordered_map<Value *, std::set<std::pair<Value*, Value*>>> mptGEN; // instruction -> {(p,x)}
     std::unordered_map<Value *, std::set<std::pair<Value*, Value*>>> mptKILL; // instruction -> {(p,v)| v escaped}
     std::unordered_map<Value *, std::set<Value *>> ptr2Val; // p->{x | for all x that (p,x) };
-    std::unordered_map<Value *, std::set<Value *>> val2Ptr; // x->{p | for all p that (p,x) }
+    // std::unordered_map<Value *, std::set<Value *>> val2Ptr; // x->{p | for all p that (p,x) }
     std::unordered_map<Value *, std::set<std::pair<Value*, Value*>>> mptIN;
     std::unordered_map<Value *, std::set<std::pair<Value*, Value*>>> mptOUT;
 
-
-    std::unordered_map<Value*, std::set<Value*>> mayPointTo;
-    
     /**
      * maps from user call to a map from its argument to replacement
      * Keep it map as we might need to iterate pretty often
@@ -288,34 +287,37 @@ struct CAT : public FunctionPass {
         //phi_node_new2set(F);
         AliasAnalysis & AA = getAnalysis<AAResultsWrapperPass>().getAAResults();
         
-        sGEN_sKILL_init();
-        mptGEN_KILL(F, AA);
-        mptIN_OUT(F);
-        // print_mpt_INOUT(F);
-
-        H0_init();
-        H0_function_count(F);
-        // H0_output(caller_name);
-
-        sGEN_sKILL(F, AA);
-        //print_gen_kill(caller_name,F);
-        sIN_sOUT(F);
-        sIN_OUT_inst(F);
-        // print_in_out(F);
-
-        
+        mpt_wrap(F, AA);
+        reachingDef_wrap(F, AA);
         constant_folding(F, AA);
 
-        sGEN_sKILL_init();
-        mptGEN_KILL(F, AA);
-        mptIN_OUT(F);
-
-
-        sGEN_sKILL_init();
-        sGEN_sKILL(F, AA);
-        sIN_sOUT(F);
-        sIN_OUT_inst(F);
+        mpt_wrap(F, AA);
+        reachingDef_wrap(F, AA);
         constant_propagation(F, AA);
+        // sGEN_sKILL_init();
+        // mptGEN_KILL(F, AA);
+        // mptIN_OUT(F);
+        // // print_mpt_INOUT(F);
+
+        // sGEN_sKILL(F, AA);
+        // //print_gen_kill(caller_name,F);
+        // sIN_sOUT(F);
+        // sIN_OUT_inst(F);
+        // // print_in_out(F);
+
+        
+        // constant_folding(F, AA);
+
+        // sGEN_sKILL_init();
+        // mptGEN_KILL(F, AA);
+        // mptIN_OUT(F);
+
+
+        // sGEN_sKILL_init();
+        // sGEN_sKILL(F, AA);
+        // sIN_sOUT(F);
+        // sIN_OUT_inst(F);
+        // constant_propagation(F, AA);
         return false;
     }
 
@@ -348,13 +350,20 @@ struct CAT : public FunctionPass {
         sOUT.clear();
 
         arg_set.clear();
-        mayPointTo.clear();
+    }
+
+    void mpt_init() {
+        // std::unordered_map<Value *, std::set<std::pair<Value*, Value*>>> mptGEN; // instruction -> {(p,x)}
+        // std::unordered_map<Value *, std::set<std::pair<Value*, Value*>>> mptKILL; // instruction -> {(p,v)| v escaped}
+        // std::unordered_map<Value *, std::set<Value *>> ptr2Val; // p->{x | for all x that (p,x) };
+        // // std::unordered_map<Value *, std::set<Value *>> val2Ptr; // x->{p | for all p that (p,x) }
+        // std::unordered_map<Value *, std::set<std::pair<Value*, Value*>>> mptIN;
+        // std::unordered_map<Value *, std::set<std::pair<Value*, Value*>>> mptOUT;
         mptGEN.clear();
         mptKILL.clear();
-
+        mptIN.clear();
+        mptOUT.clear();
         ptr2Val.clear();
-        val2Ptr.clear();
-
     }
     
 
@@ -374,10 +383,6 @@ struct CAT : public FunctionPass {
         select_trace_back(op2, res);
     }
 
-    
-    void ptr_GEN_KILL(Function &F, AliasAnalysis & AA) {
-
-    }
 
     void mptGEN_KILL(Function &F, AliasAnalysis & AA){
         findCATVar(F);
@@ -683,20 +688,7 @@ struct CAT : public FunctionPass {
 
 
     }
-    Value* getVar(Value *arg){
-        if(IN_MAP(ptrToVal, arg)){
-            Value* next_arg = ptrToVal[arg];
-            return getVar(next_arg);
-        }
-        return arg;
-    }
-    void mptKill(Value *inst,Value *arg){
-        if (isa<PointerType>(arg->getType())) {
-            for(auto &val:ptr2Val[arg]){
-                mptKILL[inst].insert(std::make_pair(arg,val));
-            }
-        }
-    }
+    
 
     void findCATVar(Function &F){
         cat_var.clear();
@@ -723,6 +715,11 @@ struct CAT : public FunctionPass {
         }
     }
 
+    void mpt_wrap(Function &F, AliasAnalysis & AA) {
+        mpt_init();
+        mptGEN_KILL(F, AA);
+        mptIN_OUT(F);
+    }
         
     /**
      *  Expect arg to be a pointer 
@@ -1079,6 +1076,16 @@ struct CAT : public FunctionPass {
         }
     }
     
+    void reachingDef_wrap(Function &F, AliasAnalysis & AA) {
+        sGEN_sKILL_init();
+        sGEN_sKILL(F, AA);
+        //print_gen_kill(caller_name,F);
+        sIN_sOUT(F);
+        sIN_OUT_inst(F);
+        // print_in_out(F);
+    }
+    
+
     void print_in_out(Function &F){
         errs() << "Function \"" << F.getName() << "\" " << '\n';
         unsigned inst_counter = 0;
@@ -1682,7 +1689,7 @@ struct CAT : public FunctionPass {
             }
             
         }
-        
+
         /**
          * If one alias is sure to be constant we should be good to propogate
          * */
