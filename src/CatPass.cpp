@@ -1,13 +1,9 @@
-// #include "llvm/Pass.h"
-// #include "llvm/IR/Function.h"
-// #include "llvm/Support/raw_ostream.h"
-// #include "llvm/IR/LegacyPassManager.h"
-// #include "llvm/Transforms/IPO/PassManagerBuilder.h"
-
+#include "llvm/IR/Module.h"
 #include "llvm/Pass.h"
 #include "llvm/IR/Function.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/IR/LegacyPassManager.h"
+#include "llvm/Analysis/CallGraph.h"
 #include "llvm/Transforms/IPO/PassManagerBuilder.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/InstIterator.h"
@@ -33,7 +29,7 @@ using namespace llvm;
 
 namespace {
 
-struct CAT : public FunctionPass {
+struct CAT : public ModulePass {
     static char ID; 
     Module *currentModule;
     std::unordered_set<Function *> user_func;
@@ -248,7 +244,7 @@ struct CAT : public FunctionPass {
 
 
         // class to represent a disjoint set
-        CAT() : FunctionPass(ID) {}
+        CAT() : ModulePass(ID) {}
 
     // This function is invoked once at the initialization phase of the compiler
     // The LLVM IR of functions isn't ready at this point
@@ -279,47 +275,71 @@ struct CAT : public FunctionPass {
         
     }
 
-
     // This function is invoked once per function compiled
     // The LLVM IR of the input functions is ready and it can be analyzed and/or transformed
-    bool runOnFunction (Function &F) override {
-        //findCatVariables(F);
-        //phi_node_new2set(F);
-        AliasAnalysis & AA = getAnalysis<AAResultsWrapperPass>().getAAResults();
+    bool runOnModule (Module &M) override {
         
-        mpt_wrap(F, AA);
-        reachingDef_wrap(F, AA);
-        constant_folding(F, AA);
-
-        mpt_wrap(F, AA);
-        reachingDef_wrap(F, AA);
-        constant_propagation(F, AA);
-        // sGEN_sKILL_init();
-        // mptGEN_KILL(F, AA);
-        // mptIN_OUT(F);
-        // // print_mpt_INOUT(F);
-
-        // sGEN_sKILL(F, AA);
-        // //print_gen_kill(caller_name,F);
-        // sIN_sOUT(F);
-        // sIN_OUT_inst(F);
-        // // print_in_out(F);
-
+        CallGraph &CG = getAnalysis<CallGraphWrapperPass>().getCallGraph();
         
-        // constant_folding(F, AA);
+        
+        for (Function & F: M){
+            if (!F.empty()){
+                AliasAnalysis & AA = getAnalysis<AAResultsWrapperPass>(F).getAAResults();
 
-        // sGEN_sKILL_init();
-        // mptGEN_KILL(F, AA);
-        // mptIN_OUT(F);
+                mpt_wrap(F, AA);
+                reachingDef_wrap(F, AA);
+                constant_folding(F, AA);
 
+                mpt_wrap(F, AA);
+                reachingDef_wrap(F, AA);
+                constant_propagation(F, AA);
+            }
+            
+        }
 
-        // sGEN_sKILL_init();
-        // sGEN_sKILL(F, AA);
-        // sIN_sOUT(F);
-        // sIN_OUT_inst(F);
-        // constant_propagation(F, AA);
         return false;
     }
+
+    // // This function is invoked once per function compiled
+    // // The LLVM IR of the input functions is ready and it can be analyzed and/or transformed
+    // bool runOnFunction (Function &F) override {
+    //     //findCatVariables(F);
+    //     //phi_node_new2set(F);
+    //     AliasAnalysis & AA = getAnalysis<AAResultsWrapperPass>().getAAResults();
+    //     CallGraph &CG = getAnalysis<CallGraphWrapperPass>().getCallGraph();
+    //     mpt_wrap(F, AA);
+    //     reachingDef_wrap(F, AA);
+    //     constant_folding(F, AA);
+
+    //     mpt_wrap(F, AA);
+    //     reachingDef_wrap(F, AA);
+    //     constant_propagation(F, AA);
+    //     // sGEN_sKILL_init();
+    //     // mptGEN_KILL(F, AA);
+    //     // mptIN_OUT(F);
+    //     // // print_mpt_INOUT(F);
+
+    //     // sGEN_sKILL(F, AA);
+    //     // //print_gen_kill(caller_name,F);
+    //     // sIN_sOUT(F);
+    //     // sIN_OUT_inst(F);
+    //     // // print_in_out(F);
+
+        
+    //     // constant_folding(F, AA);
+
+    //     // sGEN_sKILL_init();
+    //     // mptGEN_KILL(F, AA);
+    //     // mptIN_OUT(F);
+
+
+    //     // sGEN_sKILL_init();
+    //     // sGEN_sKILL(F, AA);
+    //     // sIN_sOUT(F);
+    //     // sIN_OUT_inst(F);
+    //     // constant_propagation(F, AA);
+    //     return false;
+    // }
 
     // We don't modify the program, so we preserve all analyses.
     // The LLVM IR of functions isn't ready at this point
@@ -328,6 +348,7 @@ struct CAT : public FunctionPass {
 
         // AU.setPreservesAll();
         AU.addRequired<AAResultsWrapperPass>();
+        AU.addRequired<CallGraphWrapperPass>();
     }
 
         //naive GEN KILL IN OUT
