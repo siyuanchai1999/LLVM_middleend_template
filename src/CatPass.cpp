@@ -32,8 +32,8 @@ namespace {
 struct CAT : public ModulePass {
     static char ID; 
     Module *currentModule;
-    std::unordered_set<Function *> user_func;
-#define IS_USER_FUNC(fptr) (IN_SET(user_func, fptr))
+
+#define IS_USER_FUNC(fptr) (!fptr->empty())
     std::set<std::string> func_set = {
         "CAT_new",
         "CAT_add",
@@ -109,6 +109,8 @@ struct CAT : public ModulePass {
     std::map<Instruction *, std::map<Value *, Instruction *>> userCall2replace;
     std::map<Instruction *, std::pair<Instruction *, Value * >> replace2userCall;
 
+    enum CycleResult {noCycle, mustCycle, mightCycle};
+    std::unordered_map<Value *, CycleResult> func2cycle;
 #define IS_PTR_TYPE(val) (isa<PointerType>(val->getType()) )
 
 #define HAS_MOD(info) (\
@@ -193,6 +195,30 @@ struct CAT : public ModulePass {
         return str;
     }
 
+    std::string CycleResult_toString(CycleResult res){
+        std::string str;
+        switch (res)
+        {
+        case CycleResult::noCycle :
+            str = "CycleResult::noCycle";
+            break;
+
+        case CycleResult::mustCycle :
+            str = "CycleResult::mustCycle";
+            break;
+        
+        case CycleResult::mightCycle :
+            str = "CycleResult::mightCycle";
+            break;
+
+        default:
+            str = "";
+            break;
+        }
+
+        return str;
+    }
+
     template<class T>
     void set_union(std::set<T> & srcA, std::set<T> & srcB, std::set<T> & target){
         std::vector<T> output_vec = std::vector<T>(srcA.size() + srcB.size());
@@ -252,15 +278,6 @@ struct CAT : public ModulePass {
         // errs() << "Hello LLVM World at \"doInitialization\"\n" ;
         currentModule = &M;
 
-        for (Function & F: M) {
-            /**
-             * Function with basic blocks are user defined function
-             * */
-            if (!F.empty()){
-                user_func.insert(&F);
-            }
-        }
-
         for (const std::string & str : func_set) {
             Function * fptr = M.getFunction(StringRef(str));
             fptr2name[fptr] = str;
@@ -281,7 +298,8 @@ struct CAT : public ModulePass {
         
         CallGraph &CG = getAnalysis<CallGraphWrapperPass>().getCallGraph();
         
-        
+        function_inline(M, CG);
+
         for (Function & F: M){
             if (!F.empty()){
                 AliasAnalysis & AA = getAnalysis<AAResultsWrapperPass>(F).getAAResults();
@@ -349,6 +367,126 @@ struct CAT : public ModulePass {
         // AU.setPreservesAll();
         AU.addRequired<AAResultsWrapperPass>();
         AU.addRequired<CallGraphWrapperPass>();
+    }
+
+    
+    CycleResult is_cycle_call(Function * F, CallGraph &CG) {
+        CallGraphNode *n = CG[F];
+        std::set<Function*> visited {F};
+        for (auto callee : *n){
+            CallGraphNode * calleeNode = callee.second;
+            auto callInst = callee.first;
+
+            auto calleeF = calleeNode->getFunction();
+            if (calleeF == nullptr) {
+                return mightCycle;
+            }
+
+            if (!IS_USER_FUNC(calleeF)) continue;
+            
+            CycleResult sub_result = is_cycle_call_helper(F, calleeF, CG, visited);
+            if (sub_result != noCycle) {
+                return sub_result;
+            }
+        }
+        return noCycle;
+    }
+
+    CycleResult is_cycle_call_helper(
+        Function * targetF, 
+        Function * currF, 
+        CallGraph &CG,
+        std::set<Function*> visited
+    ) {
+        // errs() << "targetF = " << targetF->getName();
+        // errs() << "currF = "   << currF->getName()  << '\n';
+        if (IN_SET(visited, currF)) {
+            if (currF == targetF){
+                return mustCycle;
+            } else {
+                return noCycle;
+            }
+        }
+
+        CallGraphNode *curr_node = CG[currF];
+        visited.insert(currF);
+
+        for (auto callee : *curr_node) {
+            CallGraphNode * calleeNode = callee.second;
+            auto callInst = callee.first;
+
+            Function * calleeF = calleeNode->getFunction();
+            if (calleeF == nullptr) {
+                return mightCycle;
+            }
+            
+            if (!IS_USER_FUNC(calleeF)) continue;
+            CycleResult sub_result = is_cycle_call_helper(targetF, calleeF, CG, visited);
+
+            /**
+             *  Return cycle information once found suspicious
+             * */
+            if (sub_result != noCycle) {
+                return sub_result;
+            }
+        }
+
+        return noCycle;
+    }
+
+
+    /**
+     *  Find out if Function F is in a cycle that points back to itself
+     *      info store in func2cycle
+     * */
+    void Fill_func2cycle(Module &M, CallGraph &CG) {
+        for (Function & F : M) {
+            if (F.empty()) continue;
+            
+            CycleResult f_cycle = is_cycle_call(&F, CG);
+            func2cycle[&F] = f_cycle;
+        }
+
+        for (auto & F_cycle : func2cycle) {
+            errs() << F_cycle.first->getName() << " is ";
+            errs() << CycleResult_toString(F_cycle.second) << '\n';
+        }
+    }
+
+    bool function_inline(Module &M, CallGraph &CG) {
+        
+        Fill_func2cycle(M, CG);
+        std::vector<CallInst *> inline_calls;
+        bool inlined = false;
+
+        for (Function & F: M) {
+            for (Instruction & inst : instructions(F)) {
+                if (isa<CallInst>(inst)) {
+                    CallInst * call_inst = cast<CallInst>(&inst);
+                    Function * fptr = call_inst->getCalledFunction();
+
+                    /**
+                     *  Try to inline user-defined function
+                     * */
+                    if (fptr && IS_USER_FUNC(fptr)) {
+                        if (func2cycle[fptr] == noCycle) {
+                            inline_calls.push_back(call_inst);
+                        }
+                    }
+                }
+                
+            }
+        }
+
+        for (CallInst * call: inline_calls) {
+            errs() << "Inlining " << call->getCalledFunction()->getName();
+            errs() << " to " << call->getParent()->getParent()->getName() << "\n";
+            InlineFunctionInfo  IFI;
+            inlined |= InlineFunction(call, IFI);
+        }
+        
+        errs() << "Finish inlining\n";
+        return inlined;
     }
 
         //naive GEN KILL IN OUT
@@ -752,7 +890,7 @@ struct CAT : public ModulePass {
                                     true);
 
         Instruction *newInst = BinaryOperator::Create(Instruction::Add, zeroConst, zeroConst, "replacing");
-        errs() << *newInst << " at " << newInst << '\n';
+        // errs() << *newInst << " at " << newInst << '\n';
         return newInst;
     }
 
@@ -897,8 +1035,8 @@ struct CAT : public ModulePass {
                                 ModRefInfo info = AA.getModRefInfo(call_instr, memLoc); 
 
 
-                                errs() << *call_instr << " has arg " << *arg << " at " << arg;
-                                errs() << "arg points to " << *possible_vals[j] <<  " with ModRefInfo = " << ModRefInfo_toString(info) <<'\n';
+                                // errs() << *call_instr << " has arg " << *arg << " at " << arg;
+                                // errs() << "arg points to " << *possible_vals[j] <<  " with ModRefInfo = " << ModRefInfo_toString(info) <<'\n';
                                 if (HAS_MOD(info)){
                                     
                                     Value * dummy = dummy_def_val(possible_vals[j], call_instr);
@@ -1800,6 +1938,20 @@ struct CAT : public ModulePass {
                     
                     CallInst * call_instr = cast<CallInst>(&inst);
                     Function * callee_ptr = call_instr->getCalledFunction();
+
+                    /**
+                     *  CAT_sub trick
+                     * */
+                    // if (IS_CAT_sub(callee_ptr)) {
+                    //     Value * arg1 = call_instr->getArgOperand(1);
+                    //     Value * arg2 = call_instr->getArgOperand(2);
+                    //     if (arg1 == arg2) {
+                    //         int64_t substitution = 0;
+                    //         toFold_helper[call_instr] = substitution;
+                    //         continue;
+                    //     }
+                    // }
+
                     if (IS_CAT_add(callee_ptr) || IS_CAT_sub(callee_ptr)) {
                         
                         // errs() << "Constant Folding on " << *call_instr  << '\n';
