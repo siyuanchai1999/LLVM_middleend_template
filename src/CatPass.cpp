@@ -316,6 +316,10 @@ struct CAT : public ModulePass {
                     mpt_wrap(F, AA);
                     reachingDef_wrap(F, AA);
                     constant_propagation(F, AA);
+
+                    for (BasicBlock & BB: F) {
+                        errs() << BB; 
+                    }
                 }
             }
         }
@@ -1749,6 +1753,24 @@ struct CAT : public ModulePass {
         return const_phi;
     }
     
+    PHINode * create_const_phi (PHINode * phi, std::vector<Value *> & temp_vals) {
+        Type * llvm_int64 =  IntegerType::get(currentModule->getContext(), 64);
+
+        PHINode * const_phi = PHINode::Create(
+            llvm_int64,
+            phi->getNumIncomingValues(),
+            "const_phi"
+        );
+
+        for (uint32_t i = 0; i < phi->getNumIncomingValues(); i++) {
+            const_phi->addIncoming(
+                temp_vals[i],
+                phi->getIncomingBlock(i)
+            );
+        }
+        errs() << "Creating const phi " << *const_phi << " before " << *phi << '\n';
+        return const_phi;
+    }
 
     Value * build_add_sub(CallInst * call, Value * arg1_val, Value * arg2_val) {
         Function * fptr = call->getCalledFunction();
@@ -2026,7 +2048,46 @@ struct CAT : public ModulePass {
         return false; 
     }
 
-    bool VAL_check_constant_AA_wrap(AliasAnalysis & AA, Instruction * instr, Value * arg, Value ** res) {
+    /**
+     *  (instruction to be replaced -> (old phi -> set of new phi))
+     * */
+    std::map<Instruction *, std::map<PHINode *, std::set<PHINode *>>> phi_toInsert;
+
+    void insert_phi_constant() {
+        for (auto & instr_phiPair : phi_toInsert) {
+            Instruction * inst = instr_phiPair.first;
+            for (auto & old_new : phi_toInsert[inst]) {
+                PHINode * oldPhi = old_new.first;
+
+                for (PHINode * newPhi : old_new.second){
+                
+                    /**
+                     *  Insert a copy of newPhi into the IR
+                     * */
+                    IRBuilder<> builder(oldPhi);
+                    Type * llvm_int64 =  IntegerType::get(currentModule->getContext(), 64);
+
+                    builder.Insert(newPhi);
+                }
+            }
+        }
+    }
+
+    void delete_phi_constant(Instruction * inst) {
+        for (auto & old_news : phi_toInsert[inst]) {
+            for (PHINode * newPhi : old_news.second) {
+                delete newPhi;
+            }
+        }
+        phi_toInsert.erase(inst);
+    }
+
+    bool VAL_check_constant_AA_wrap(
+        AliasAnalysis & AA, 
+        Instruction * instr, 
+        Value * arg, 
+        Value ** res
+    ) {
         std::vector<Value *> aliases;
         aliases.push_back(arg);
         
@@ -2049,7 +2110,7 @@ struct CAT : public ModulePass {
          * */
         Value * temp_val;
         for (uint32_t i = 0; i < aliases.size(); i++) {
-            if(VAL_check_constant_s(instr, aliases[i], &temp_val)) {
+            if(VAL_check_constant_s(instr, aliases[i], NULL, &temp_val)) {
                 *res = temp_val;
                 return true;
             }
@@ -2062,7 +2123,7 @@ struct CAT : public ModulePass {
             if (Value * val  = must_point2(instr, ptr)) {
                 errs() << "At instruction : " << *instr; 
                 errs() << " the load result must be " << *val << '\n';
-                if(VAL_check_constant_s(instr, val, &temp_val)) {
+                if(VAL_check_constant_s(instr, val, NULL, &temp_val)) {
                     *res = temp_val;
                     return true;
                 }
@@ -2071,7 +2132,40 @@ struct CAT : public ModulePass {
         return false;
     }
 
-    bool VAL_check_constant_s(Instruction * instr, Value * arg, Value ** res) {
+    bool VAL_check_constant_s_phi_helper(Instruction * instr, PHINode * phi, Value ** res) {
+        uint32_t numIncoming = phi->getNumIncomingValues();
+        std::vector<Value *> temp_val_arr(numIncoming);
+
+        for (uint32_t i = 0; i < numIncoming; i++) {
+            Value * inValue = phi->getIncomingValue(i);
+            BasicBlock * inBB = phi->getIncomingBlock(i);
+            if (!VAL_check_constant_s(instr, inValue, inBB, &temp_val_arr[i]) ){
+                return false;
+            }
+        }
+    
+        if (temp_val_arr.size() == 0) return false;
+
+        if (VAL_vec_all_equal(temp_val_arr)){
+            *res = temp_val_arr[0];
+            return true;
+
+        } else if (numIncoming == temp_val_arr.size()) {
+            /**
+             *  All constant but not same value, why not substitute with a phi node
+             * */
+            
+            PHINode * new_phi = create_const_phi(phi, temp_val_arr);
+
+            phi_toInsert[instr][phi].insert(new_phi);
+            *res = cast<Value>(new_phi); 
+            return true;
+        }
+
+        return false;
+    }
+
+    bool VAL_check_constant_s(Instruction * instr, Value * arg, BasicBlock * incomingBB, Value ** res) {
         
         /**
          * Find the intersection between reaching definition of instr and definitions that define arg
@@ -2080,6 +2174,14 @@ struct CAT : public ModulePass {
         // set_intersect(sIN[instr], sVar2Def[arg], arg_defs);
         set_union(sVar2Def[arg], sVar2mightDef[arg], arg_defs);
         set_intersect(sIN[instr], arg_defs, arg_defs);
+
+        errs() << "arg_defs of " << *arg  <<  " at " << *instr << " = \n";
+        print_set_with_addr(arg_defs);
+
+        if (incomingBB) {
+            set_intersect(sBB_OUT[incomingBB], arg_defs, arg_defs);
+        }
+
         errs() << "arg_defs of " << *arg  <<  " at " << *instr << " = \n";
         print_set_with_addr(arg_defs);
         
@@ -2097,14 +2199,20 @@ struct CAT : public ModulePass {
         uint32_t idx = 0;
 
         for (auto & def : arg_defs) {
-            bool is_const = VAL_check_constant_val(instr, def, &const_vec[idx]);
+            bool is_const = false;
+            if (isa<PHINode>(def)){
+                PHINode * phi = cast<PHINode>(def);
+                is_const = VAL_check_constant_s_phi_helper(instr, phi, &const_vec[idx]);
+            } else {
+                is_const = VAL_check_constant_val(instr, def, &const_vec[idx]);
+            }   
             
             /**
              * false immediately if one any of the definition is not a constant
              * */
             if (!is_const) return false;
             
-            errs() << "const = " << *const_vec[idx] << '\n';
+            // errs() << "const = " << *const_vec[idx] << '\n';
             idx++;
         }   
         
@@ -2136,34 +2244,34 @@ struct CAT : public ModulePass {
         /**
          * If the imcoming node is Phi Node definition, we recursively check if each of its incoming value is constant
          * */
-        if (isa<PHINode>(def)){
-            PHINode * phi = cast<PHINode>(def);
-            uint32_t numIncoming = phi->getNumIncomingValues();
-            std::vector<Value *> temp_val_arr(numIncoming);
+        // if (isa<PHINode>(def)){
+        //     PHINode * phi = cast<PHINode>(def);
+        //     uint32_t numIncoming = phi->getNumIncomingValues();
+        //     std::vector<Value *> temp_val_arr(numIncoming);
 
-            for (uint32_t i = 0; i < numIncoming; i++) {
-                Value * inValue = phi->getIncomingValue(i);
-                if (!VAL_check_constant_val(instr, inValue, &temp_val_arr[i]) ){
-                    return false;
-                }
-            }
+        //     for (uint32_t i = 0; i < numIncoming; i++) {
+        //         Value * inValue = phi->getIncomingValue(i);
+        //         if (!VAL_check_constant_val(instr, inValue, &temp_val_arr[i]) ){
+        //             return false;
+        //         }
+        //     }
         
-            if (temp_val_arr.size() == 0) return false;
+        //     if (temp_val_arr.size() == 0) return false;
 
-            if (VAL_vec_all_equal(temp_val_arr)){
-                *res = temp_val_arr[0];
-                return true;
+        //     if (VAL_vec_all_equal(temp_val_arr)){
+        //         *res = temp_val_arr[0];
+        //         return true;
 
-            } else if (numIncoming == temp_val_arr.size()) {
-                /**
-                 *  All constant but not same value, why not substitute with a phi node
-                 * */
-                *res = build_const_phi(instr, phi, temp_val_arr);
-                return true;
-            }
+        //     } else if (numIncoming == temp_val_arr.size()) {
+        //         /**
+        //          *  All constant but not same value, why not substitute with a phi node
+        //          * */
+        //         *res = build_const_phi(instr, phi, temp_val_arr);
+        //         return true;
+        //     }
 
-            return false;
-        }  
+        //     return false;
+        // }  
 
         /**
          * If the imcoming node is a replaced dummy definition, it's not a constant, so far
@@ -2194,11 +2302,17 @@ struct CAT : public ModulePass {
             // cat_new(xx)
             arg = call_instr->getArgOperand(0);
         }
-
-        if (isa<ConstantInt>(arg)){
+        
+        // if (isa<ConstantInt>(arg)){
+            
+        //     // *res = cast<ConstantInt>(arg)->getSExtValue();
+        //     *res = cast<ConstantInt>(arg);
+        //     return true;
+        // }
+        if (isa<IntegerType>(arg->getType())){
             
             // *res = cast<ConstantInt>(arg)->getSExtValue();
-            *res = cast<ConstantInt>(arg);
+            *res = arg;
             return true;
         }
         return false; 
@@ -2223,7 +2337,9 @@ struct CAT : public ModulePass {
         errs() << "Folding on " << F.getName().str() << '\n';
         unsigned inst_counter = 0;
         std::unordered_map<llvm::CallInst *, Value *> toFold;
-        std::unordered_map<llvm::CallInst *, Value *> toFold_helper;
+        std::unordered_map<llvm::CallInst *, std::pair<Value *, Value *>> toFold_helper;
+
+        phi_toInsert.clear();
         for (BasicBlock &bb : F){
             for(Instruction &inst : bb){
                 if (isa<CallInst>(&inst)) {
@@ -2234,15 +2350,18 @@ struct CAT : public ModulePass {
                     /**
                      *  CAT_sub trick
                      * */
-                    // if (IS_CAT_sub(callee_ptr)) {
-                    //     Value * arg1 = call_instr->getArgOperand(1);
-                    //     Value * arg2 = call_instr->getArgOperand(2);
-                    //     if (arg1 == arg2) {
-                    //         int64_t substitution = 0;
-                    //         toFold_helper[call_instr] = substitution;
-                    //         continue;
-                    //     }
-                    // }
+                    if (IS_CAT_sub(callee_ptr)) {
+                        Value * arg1 = call_instr->getArgOperand(1);
+                        Value * arg2 = call_instr->getArgOperand(2);
+                        if (arg1 == arg2) {
+                            int64_t substitution = 0;
+                            toFold_helper[call_instr] = std::make_pair(
+                                build_constint(0),
+                                build_constint(0)
+                            ) ;
+                            continue;
+                        }
+                    }
 
                     if (IS_CAT_add(callee_ptr) || IS_CAT_sub(callee_ptr)) {
                         
@@ -2276,9 +2395,12 @@ struct CAT : public ModulePass {
                         if (arg1_const && arg2_const) {
                             // toFold[call_instr] = build_cat_set(call_instr, substitution);
                             
-                            // errs() << "Folding " << *call_instr << " with " << substitution << '\n';
-                            Value * substitution = build_add_sub(call_instr, arg1_LLVM_val, arg2_LLVM_val);
-                            toFold_helper[call_instr] = substitution;
+                            
+                            // Value * substitution = build_add_sub(call_instr, arg1_LLVM_val, arg2_LLVM_val);
+                            // errs() << "Folding " << *call_instr << " with set " << *substitution << '\n';
+                            toFold_helper[call_instr] = std::make_pair(arg1_LLVM_val, arg2_LLVM_val);
+                        } else {
+                            delete_phi_constant(call_instr);
                         }
                     }
                 }
@@ -2286,14 +2408,19 @@ struct CAT : public ModulePass {
             }
         }
 
+        insert_phi_constant();
+        
         for (auto &kv: toFold_helper) {
-            toFold[kv.first] = build_cat_set(kv.first, kv.second);
+            Value * substitution = build_add_sub(kv.first, kv.second.first, kv.second.second);
+            errs() << "Folding " << *kv.first << " by CATset " << *substitution << " at " << substitution << '\n';
+            toFold[kv.first] = build_cat_set(kv.first, substitution);
         }
         replace_from_map(toFold);
     }
 
     void constant_propagation(Function & F, AliasAnalysis & AA) {
         errs() << "Propogate on " << F.getName().str() << '\n';
+        phi_toInsert.clear();
         unsigned inst_counter = 0;
         std::unordered_map<llvm::CallInst *, Value *> toPropogate;
 
@@ -2316,11 +2443,16 @@ struct CAT : public ModulePass {
                             toPropogate[call_instr] = arg_LLVM_val;
 
                             errs() << "Propogate " << *call_instr << " with " << *arg_LLVM_val << '\n';
+                        } else {
+                            // phi_toInsert.erase(call_instr);
+                            delete_phi_constant(call_instr);
                         }
                     }
                 }
             }
         }
+
+        insert_phi_constant();
         replace_from_map(toPropogate);
 
         // errs() << "Done: constant prop !\n";
