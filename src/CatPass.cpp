@@ -477,7 +477,7 @@ struct CAT : public ModulePass {
                             inline_calls.push_back(call_inst);
                         } else {
                             // if (F.getName().str() == "main" 
-                            //     && F.getInstructionCount() < 256
+                            //     && F.getInstructionCount() < 64
                             // ) {
                             //     inline_calls.push_back(call_inst);
                             // }
@@ -1679,6 +1679,26 @@ struct CAT : public ModulePass {
         return true;
     }
 
+    bool VAL_vec_all_equal(std::vector<Value *> &v) {
+        /**
+         * Needs to be fixed
+         * 
+         * */
+        if (v.size() <= 1) return true;
+        
+        for (unsigned i = 0; i < v.size(); i++) {
+            if (!isa<ConstantInt>(v[i])) return false;
+        }
+
+        int64_t head = cast<ConstantInt>(v[0])->getSExtValue();
+        for (unsigned i = 0; i < v.size(); i++) {
+            int64_t curr = cast<ConstantInt>(v[i])->getSExtValue();
+
+            if (head != curr) return false; 
+        }
+        return true;
+    }
+
     template<typename T>
     bool vec_is_equal(std::vector<T> const &v1, std::vector<T> const &v2)
     {
@@ -1688,14 +1708,14 @@ struct CAT : public ModulePass {
 
 
     // create set instruction before cat_add or cat_sub
-    Value * build_cat_set(CallInst * call_instr, int64_t set_val) {
+    Value * build_cat_set(CallInst * call_instr, Value * set_val) {
         IRBuilder<> builder(call_instr);
         std::vector<Value *> arg_vec;
         arg_vec.push_back(call_instr->getArgOperand(0));
 
-        Type * llvm_int64 =  IntegerType::get(currentModule->getContext(), 64);
-        Value * val = ConstantInt::get(llvm_int64, set_val, true);
-        arg_vec.push_back(val);
+        // Type * llvm_int64 =  IntegerType::get(currentModule->getContext(), 64);
+        // Value * val = ConstantInt::get(llvm_int64, set_val, true);
+        arg_vec.push_back(set_val);
         ArrayRef<Value *> arg_arr_ref = ArrayRef<Value *>(arg_vec);
         // arg_arr.
         Value * added_inst = builder.CreateCall(CAT_set_ptr, arg_arr_ref);
@@ -1709,80 +1729,51 @@ struct CAT : public ModulePass {
         return val;
     }
 
+    Value * build_const_phi (Instruction * inst, PHINode * phi, std::vector<Value *> & temp_vals) {
+        IRBuilder<> builder(phi);
+        Type * llvm_int64 =  IntegerType::get(currentModule->getContext(), 64);
 
-    /**
-     *  check if given @val defines a constant
-     *  if so result is stored in res, and return true
-     *  otherwise return false, res is not touched
-     * */ 
-    bool check_constant_val(Value * def, int64_t * res) {
-        /**
-         * If the imcoming node is a Argument definition, it's not a constant, so far
-         * */
-        if (isa<Argument>(def)) {
-            return false;
+        PHINode * const_phi = builder.CreatePHI(
+            llvm_int64,
+            phi->getNumIncomingValues(),
+            "const_phi"
+        );
+
+        for (uint32_t i = 0; i < phi->getNumIncomingValues(); i++) {
+            const_phi->addIncoming(
+                temp_vals[i],
+                phi->getIncomingBlock(i)
+            );
         }
 
+        return const_phi;
+    }
+    
 
-        /**
-         * If the imcoming node is Phi Node definition, we recursively check if each of its incoming value is constant
-         * */
-        if (isa<PHINode>(def)){
-            PHINode * phi = cast<PHINode>(def);
-            uint32_t numIncoming = phi->getNumIncomingValues();
-            std::vector<int64_t> temp_val_arr(numIncoming);
+    Value * build_add_sub(CallInst * call, Value * arg1_val, Value * arg2_val) {
+        Function * fptr = call->getCalledFunction();
+        IRBuilder<> builder(call);
+        Value * result = NULL;
 
-            for (uint32_t i = 0; i < numIncoming; i++) {
-                Value * inValue = phi->getIncomingValue(i);
-                if (!check_constant_val(inValue, &temp_val_arr[i]) ){
-                    return false;
-                }
-            }
-
-            if (vec_all_equal(temp_val_arr) && temp_val_arr.size() > 0){
-                *res = temp_val_arr[0];
-                return true;
-            }
-
-            return false;
-        }  
-
-        /**
-         * If the imcoming node is a replaced dummy definition, it's not a constant, so far
-         * */
-        if(!isa<Instruction>(def)){
-            return false;
-        }
-        
-        if (IN_MAP(replace2userCall, cast<Instruction>(def))) {
-            return false;
-        }
-        
-        if (!isa<CallInst>(def)) return false;
-
-        CallInst * call_instr = cast<CallInst>(def);
-        // must be a cat_set or cat_new for constant propagation or folding
-        Function * callee = call_instr->getCalledFunction();
-        
-        if (!IS_CONST_CAT_OP(callee)) return false;
-
-        // bool is_const = get_const_CATnew_CATset(call_instr, res);
-        Value * arg;
-        
-        if (IS_CAT_set(callee)){
-            // cat_set(d, xx)
-            arg = call_instr->getArgOperand(1);
+        if (IS_CAT_sub(fptr)) {
+            result = builder.CreateSub(
+                arg1_val,
+                arg2_val,
+                "folding val"
+            );
+        } else if(IS_CAT_add(fptr)) {
+            result = builder.CreateAdd(
+                arg1_val,
+                arg2_val,
+                "folding val"
+            );
         } else {
-            // cat_new(xx)
-            arg = call_instr->getArgOperand(0);
+            /**
+             *  Not supposed to be other functions
+             * */
         }
 
-        if (isa<ConstantInt>(arg)){
-            
-            *res = cast<ConstantInt>(arg)->getSExtValue();
-            return true;
-        }
-        return false; 
+        return result;
     }
 
     /**
@@ -1929,6 +1920,7 @@ struct CAT : public ModulePass {
         
         // errs() << "sVar2mightDef[arg] = \n";
         // print_set_with_addr(sVar2mightDef[arg]);
+        
         /**
          * No available reaching definition
          * */
@@ -1958,6 +1950,260 @@ struct CAT : public ModulePass {
         return false;
 
     }
+
+    /**
+     *  check if given @val defines a constant
+     *  if so result is stored in res, and return true
+     *  otherwise return false, res is not touched
+     * */ 
+    bool check_constant_val(Value * def, int64_t * res) {
+        /**
+         * If the imcoming node is a Argument definition, it's not a constant, so far
+         * */
+        if (isa<Argument>(def)) {
+            return false;
+        }
+
+
+        /**
+         * If the imcoming node is Phi Node definition, we recursively check if each of its incoming value is constant
+         * */
+        if (isa<PHINode>(def)){
+            PHINode * phi = cast<PHINode>(def);
+            uint32_t numIncoming = phi->getNumIncomingValues();
+            std::vector<int64_t> temp_val_arr(numIncoming);
+
+            for (uint32_t i = 0; i < numIncoming; i++) {
+                Value * inValue = phi->getIncomingValue(i);
+                if (!check_constant_val(inValue, &temp_val_arr[i]) ){
+                    return false;
+                }
+            }
+
+            if (vec_all_equal(temp_val_arr) && temp_val_arr.size() > 0){
+                *res = temp_val_arr[0];
+                return true;
+            }
+
+            return false;
+        }  
+
+        /**
+         * If the imcoming node is a replaced dummy definition, it's not a constant, so far
+         * */
+        if(!isa<Instruction>(def)){
+            return false;
+        }
+        
+        if (IN_MAP(replace2userCall, cast<Instruction>(def))) {
+            return false;
+        }
+        
+        if (!isa<CallInst>(def)) return false;
+
+        CallInst * call_instr = cast<CallInst>(def);
+        // must be a cat_set or cat_new for constant propagation or folding
+        Function * callee = call_instr->getCalledFunction();
+        
+        if (!IS_CONST_CAT_OP(callee)) return false;
+
+        // bool is_const = get_const_CATnew_CATset(call_instr, res);
+        Value * arg;
+        
+        if (IS_CAT_set(callee)){
+            // cat_set(d, xx)
+            arg = call_instr->getArgOperand(1);
+        } else {
+            // cat_new(xx)
+            arg = call_instr->getArgOperand(0);
+        }
+
+        if (isa<ConstantInt>(arg)){
+            
+            *res = cast<ConstantInt>(arg)->getSExtValue();
+            return true;
+        }
+        return false; 
+    }
+
+    bool VAL_check_constant_AA_wrap(AliasAnalysis & AA, Instruction * instr, Value * arg, Value ** res) {
+        std::vector<Value *> aliases;
+        aliases.push_back(arg);
+        
+        for (auto & var : cat_var) {
+            if (var != arg){
+                AliasResult AAResult = CAT_Alias(AA, var, arg);
+
+                // errs() << "At instruction : " << *instr; 
+                // errs() << *arg << " at " << arg << " alias with " << *var << " at " << var;
+                // errs() << " with result = " << AliasResult_toString(AAResult) << '\n';
+                if (AAResult == AliasResult::MustAlias) {
+                    aliases.push_back(var);
+                }
+            }
+            
+        }
+
+        /**
+         * If one alias is sure to be constant we should be good to propogate
+         * */
+        Value * temp_val;
+        for (uint32_t i = 0; i < aliases.size(); i++) {
+            if(VAL_check_constant_s(instr, aliases[i], &temp_val)) {
+                *res = temp_val;
+                return true;
+            }
+        }
+        
+        if (isa<LoadInst>(arg)) {
+            LoadInst * loadInst = cast<LoadInst>(arg);
+            Value * ptr = loadInst->getPointerOperand();
+
+            if (Value * val  = must_point2(instr, ptr)) {
+                errs() << "At instruction : " << *instr; 
+                errs() << " the load result must be " << *val << '\n';
+                if(VAL_check_constant_s(instr, val, &temp_val)) {
+                    *res = temp_val;
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    bool VAL_check_constant_s(Instruction * instr, Value * arg, Value ** res) {
+        
+        /**
+         * Find the intersection between reaching definition of instr and definitions that define arg
+        */
+        std::set<Value *> arg_defs;
+        // set_intersect(sIN[instr], sVar2Def[arg], arg_defs);
+        set_union(sVar2Def[arg], sVar2mightDef[arg], arg_defs);
+        set_intersect(sIN[instr], arg_defs, arg_defs);
+        errs() << "arg_defs of " << *arg  <<  " at " << *instr << " = \n";
+        print_set_with_addr(arg_defs);
+        
+        // errs() << "sVar2mightDef[arg] = \n";
+        // print_set_with_addr(sVar2mightDef[arg]);
+        
+        /**
+         * No available reaching definition
+         * */
+        if (arg_defs.size() == 0) return false; 
+        /**
+         * Expected vector of constants
+         * */
+        std::vector<Value *> const_vec (arg_defs.size());
+        uint32_t idx = 0;
+
+        for (auto & def : arg_defs) {
+            bool is_const = VAL_check_constant_val(instr, def, &const_vec[idx]);
+            
+            /**
+             * false immediately if one any of the definition is not a constant
+             * */
+            if (!is_const) return false;
+            
+            errs() << "const = " << *const_vec[idx] << '\n';
+            idx++;
+        }   
+        
+
+        if (VAL_vec_all_equal(const_vec)){
+            
+            *res = const_vec[0];
+            
+            return true;
+        }
+
+        return false;
+
+    }
+    /**
+     *  check if given @val defines a constant
+     *  if so result is stored in res, and return true
+     *  otherwise return false, res is not touched
+     * */ 
+    bool VAL_check_constant_val(Instruction * instr, Value * def, Value ** res) {
+        /**
+         * If the imcoming node is a Argument definition, it's not a constant, so far
+         * */
+        if (isa<Argument>(def)) {
+            return false;
+        }
+
+
+        /**
+         * If the imcoming node is Phi Node definition, we recursively check if each of its incoming value is constant
+         * */
+        if (isa<PHINode>(def)){
+            PHINode * phi = cast<PHINode>(def);
+            uint32_t numIncoming = phi->getNumIncomingValues();
+            std::vector<Value *> temp_val_arr(numIncoming);
+
+            for (uint32_t i = 0; i < numIncoming; i++) {
+                Value * inValue = phi->getIncomingValue(i);
+                if (!VAL_check_constant_val(instr, inValue, &temp_val_arr[i]) ){
+                    return false;
+                }
+            }
+        
+            if (temp_val_arr.size() == 0) return false;
+
+            if (VAL_vec_all_equal(temp_val_arr)){
+                *res = temp_val_arr[0];
+                return true;
+
+            } else if (numIncoming == temp_val_arr.size()) {
+                /**
+                 *  All constant but not same value, why not substitute with a phi node
+                 * */
+                *res = build_const_phi(instr, phi, temp_val_arr);
+                return true;
+            }
+
+            return false;
+        }  
+
+        /**
+         * If the imcoming node is a replaced dummy definition, it's not a constant, so far
+         * */
+        if(!isa<Instruction>(def)){
+            return false;
+        }
+        
+        if (IN_MAP(replace2userCall, cast<Instruction>(def))) {
+            return false;
+        }
+        
+        if (!isa<CallInst>(def)) return false;
+
+        CallInst * call_instr = cast<CallInst>(def);
+        // must be a cat_set or cat_new for constant propagation or folding
+        Function * callee = call_instr->getCalledFunction();
+        
+        if (!IS_CONST_CAT_OP(callee)) return false;
+
+        // bool is_const = get_const_CATnew_CATset(call_instr, res);
+        Value * arg;
+        
+        if (IS_CAT_set(callee)){
+            // cat_set(d, xx)
+            arg = call_instr->getArgOperand(1);
+        } else {
+            // cat_new(xx)
+            arg = call_instr->getArgOperand(0);
+        }
+
+        if (isa<ConstantInt>(arg)){
+            
+            // *res = cast<ConstantInt>(arg)->getSExtValue();
+            *res = cast<ConstantInt>(arg);
+            return true;
+        }
+        return false; 
+    }
+
     void replace_from_map(std::unordered_map<llvm::CallInst *, llvm::Value *> & replace_map) {
         for (auto & kv: replace_map) {
             // errs() << "Replacing " << *kv.first << " with " << *kv.second << '\n';
@@ -1971,11 +2217,13 @@ struct CAT : public ModulePass {
         // errs() << "done!\n";
     }
 
+
+
     void constant_folding(Function & F, AliasAnalysis & AA) {
         errs() << "Folding on " << F.getName().str() << '\n';
         unsigned inst_counter = 0;
         std::unordered_map<llvm::CallInst *, Value *> toFold;
-        std::unordered_map<llvm::CallInst *, int64_t> toFold_helper;
+        std::unordered_map<llvm::CallInst *, Value *> toFold_helper;
         for (BasicBlock &bb : F){
             for(Instruction &inst : bb){
                 if (isa<CallInst>(&inst)) {
@@ -2008,15 +2256,28 @@ struct CAT : public ModulePass {
                         // bool arg1_const = check_constant_s(call_instr, arg1, &arg1_val);
                         // bool arg2_const = check_constant_s(call_instr, arg2, &arg2_val);
                         
-                        bool arg1_const = check_constant_AA_wrap(AA, call_instr, arg1, &arg1_val);
-                        bool arg2_const = check_constant_AA_wrap(AA, call_instr, arg2, &arg2_val);
+                        // bool arg1_const = check_constant_AA_wrap(AA, call_instr, arg1, &arg1_val);
+                        // bool arg2_const = check_constant_AA_wrap(AA, call_instr, arg2, &arg2_val);
 
-                        int64_t substitution = (IS_CAT_add(callee_ptr) ? arg1_val + arg2_val : arg1_val - arg2_val);
+                        // int64_t substitution = (IS_CAT_add(callee_ptr) ? arg1_val + arg2_val : arg1_val - arg2_val);
+                        
+                        // if (arg1_const && arg2_const) {
+                        //     // toFold[call_instr] = build_cat_set(call_instr, substitution);
+                            
+                        //     // errs() << "Folding " << *call_instr << " with " << substitution << '\n';
+                        //     toFold_helper[call_instr] = substitution;
+                        // }
+
+                        Value * arg1_LLVM_val, * arg2_LLVM_val;
+                        bool arg1_const = VAL_check_constant_AA_wrap(AA, call_instr, arg1, &arg1_LLVM_val);
+                        bool arg2_const = VAL_check_constant_AA_wrap(AA, call_instr, arg2, &arg2_LLVM_val);
+
                         
                         if (arg1_const && arg2_const) {
                             // toFold[call_instr] = build_cat_set(call_instr, substitution);
                             
                             // errs() << "Folding " << *call_instr << " with " << substitution << '\n';
+                            Value * substitution = build_add_sub(call_instr, arg1_LLVM_val, arg2_LLVM_val);
                             toFold_helper[call_instr] = substitution;
                         }
                     }
@@ -2044,12 +2305,17 @@ struct CAT : public ModulePass {
                     if(IS_CAT_get(callee_ptr)) {
                         Value * arg = call_instr->getArgOperand(0);
                         int64_t arg_val; 
+                        Value * arg_LLVM_val;
                         // bool arg_const = check_constant_s(call_instr, arg, &arg_val);
 
-                        bool arg_const = check_constant_AA_wrap(AA, call_instr, arg, &arg_val);
+                        // bool arg_const = check_constant_AA_wrap(AA, call_instr, arg, &arg_val);
+                        bool arg_const = VAL_check_constant_AA_wrap(AA, call_instr, arg, &arg_LLVM_val);
                         if (arg_const) {
                             // errs() << *call_instr << " replaced with " << arg_val <<'\n';
-                            toPropogate[call_instr] = build_constint(arg_val);
+                            // toPropogate[call_instr] = build_constint(arg_val);
+                            toPropogate[call_instr] = arg_LLVM_val;
+
+                            errs() << "Propogate " << *call_instr << " with " << *arg_LLVM_val << '\n';
                         }
                     }
                 }
