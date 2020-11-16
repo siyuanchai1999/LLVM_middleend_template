@@ -88,6 +88,8 @@ struct CAT : public ModulePass {
     std::unordered_map<Value*, std::set<Value*>> sBB_KILL;
     std::unordered_map<Value *, std::set<Value*>> sBB_IN, sBB_OUT;
     std::unordered_map<Value *, std::set<Value*>> sIN, sOUT;
+
+    std::unordered_map<Value*, std::set<Value*>> sVar2mightDef;
     // maps gen instruction to variable it defines
     
     std::unordered_map<Value *, Value*> ptrToVal;
@@ -298,23 +300,25 @@ struct CAT : public ModulePass {
         
         CallGraph &CG = getAnalysis<CallGraphWrapperPass>().getCallGraph();
         
-        function_inline(M, CG);
+        bool inlined = function_inline(M, CG);
 
-        for (Function & F: M){
-            if (!F.empty()){
-                AliasAnalysis & AA = getAnalysis<AAResultsWrapperPass>(F).getAAResults();
+        if (!inlined){
+            for (Function & F: M){
+                if (!F.empty() 
+                    // && F.getName().str() == "main"
+                ){
+                    AliasAnalysis & AA = getAnalysis<AAResultsWrapperPass>(F).getAAResults();
 
-                mpt_wrap(F, AA);
-                reachingDef_wrap(F, AA);
-                constant_folding(F, AA);
+                    mpt_wrap(F, AA);
+                    reachingDef_wrap(F, AA);
+                    constant_folding(F, AA);
 
-                mpt_wrap(F, AA);
-                reachingDef_wrap(F, AA);
-                constant_propagation(F, AA);
+                    mpt_wrap(F, AA);
+                    reachingDef_wrap(F, AA);
+                    constant_propagation(F, AA);
+                }
             }
-            
         }
-
         return false;
     }
 
@@ -471,7 +475,14 @@ struct CAT : public ModulePass {
                     if (fptr && IS_USER_FUNC(fptr)) {
                         if (func2cycle[fptr] == noCycle) {
                             inline_calls.push_back(call_inst);
+                        } else {
+                            // if (F.getName().str() == "main" 
+                            //     && F.getInstructionCount() < 256
+                            // ) {
+                            //     inline_calls.push_back(call_inst);
+                            // }
                         }
+
                     }
                 }
                 
@@ -917,7 +928,11 @@ struct CAT : public ModulePass {
      *  Given call instruction on CAT_set, CAT_add, CAT_sub
      *      find target of operation
      * */
-    Value * get_define_target(CallInst * call_instr, AliasAnalysis & AA) {
+    Value * get_define_target(
+        CallInst * call_instr, 
+        AliasAnalysis & AA,
+        std::vector<Value *> & might_defines
+    ) {
 
         Value * key = NULL;
         Value * arg0 = call_instr->getArgOperand(0);
@@ -938,8 +953,15 @@ struct CAT : public ModulePass {
             Value * ptr = loadInst->getPointerOperand();
             Value * val = must_point2(call_instr, ptr);
             
-            if (val) key = val;
-            if (!key) {
+            if (val){
+                /**
+                 *  Must point to val, so call_instr must define key
+                 * */
+                key = val;
+            } else {
+                /**
+                 *  Otherwise, it points to many variables
+                 * */
                 key = arg0;
                 for (auto & vardef : sVar2Def) {
                     Value * var = vardef.first;
@@ -947,12 +969,27 @@ struct CAT : public ModulePass {
                         key = var;   
                     }
                 }
+                
+                /**
+                 *  call_instr might also define the variables that pointed by ptr
+                 *      where arg is a load from ptr
+                 * */
+                may_point2(call_instr, ptr, might_defines);
+
             }
         }
 
         return key;
     }
 
+    void polulate_sVar2mightDef(std::vector<Value *> & might_defines, Instruction * inst) {
+        for (Value * mightdef: might_defines){
+            // errs() << *inst << " might define " << *mightdef << '\n';
+            sVar2mightDef[mightdef].insert(inst);
+        }
+    }
+
+    
     void sGEN_sKILL(Function &F, AliasAnalysis & AA){
         /**
          *  Map from gen (instruction) to variable that such gen defines
@@ -992,8 +1029,10 @@ struct CAT : public ModulePass {
 
                         } else {
                             // get first operand if CAT_set, CAT_add, CAT_sub
-
-                            key =  get_define_target(call_instr, AA);
+                            std::vector<Value *>  might_defines;
+                            key =  get_define_target(call_instr, AA, might_defines);
+                            
+                            polulate_sVar2mightDef(might_defines, &inst);
                         }
                         
                         GEN_record_info(
@@ -1882,9 +1921,14 @@ struct CAT : public ModulePass {
          * Find the intersection between reaching definition of instr and definitions that define arg
         */
         std::set<Value *> arg_defs;
-        set_intersect(sIN[instr], sVar2Def[arg], arg_defs);
-        // errs() << "arg_defs of " << *arg  <<"= \n";
+        // set_intersect(sIN[instr], sVar2Def[arg], arg_defs);
+        set_union(sVar2Def[arg], sVar2mightDef[arg], arg_defs);
+        set_intersect(sIN[instr], arg_defs, arg_defs);
+        // errs() << "arg_defs of " << *arg  <<  " at " << *instr << " = \n";
         // print_set_with_addr(arg_defs);
+        
+        // errs() << "sVar2mightDef[arg] = \n";
+        // print_set_with_addr(sVar2mightDef[arg]);
         /**
          * No available reaching definition
          * */
@@ -1928,7 +1972,7 @@ struct CAT : public ModulePass {
     }
 
     void constant_folding(Function & F, AliasAnalysis & AA) {
-        // errs() << "Folding on " << F.getName().str() << '\n';
+        errs() << "Folding on " << F.getName().str() << '\n';
         unsigned inst_counter = 0;
         std::unordered_map<llvm::CallInst *, Value *> toFold;
         std::unordered_map<llvm::CallInst *, int64_t> toFold_helper;
@@ -1988,7 +2032,7 @@ struct CAT : public ModulePass {
     }
 
     void constant_propagation(Function & F, AliasAnalysis & AA) {
-        // errs() << "Propogate on " << F.getName().str() << '\n';
+        errs() << "Propogate on " << F.getName().str() << '\n';
         unsigned inst_counter = 0;
         std::unordered_map<llvm::CallInst *, Value *> toPropogate;
 
