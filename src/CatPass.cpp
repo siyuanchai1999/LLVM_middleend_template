@@ -18,6 +18,7 @@
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/Analysis/AliasAnalysis.h"
+#include "llvm/Transforms/Utils/Cloning.h"
 #include <set>
 #include <unordered_set>
 #include <vector>
@@ -34,7 +35,7 @@ namespace {
 //     public:
 
 // };
-struct CAT : public FunctionPass {
+struct CAT : public ModulePass{
     static char ID; 
     Module *currentModule;
     std::unordered_set<Function *> user_func;
@@ -256,7 +257,7 @@ struct CAT : public FunctionPass {
     std::unordered_map<llvm::BasicBlock *, llvm::BitVector> live_GEN_BB, live_KILL_BB;
     std::unordered_map<llvm::BasicBlock *, llvm::BitVector> live_IN_BB, live_OUT_BB;
         // class to represent a disjoint set
-        CAT() : FunctionPass(ID) {}
+        CAT() : ModulePass(ID) {}
 
     // This function is invoked once at the initialization phase of the compiler
     // The LLVM IR of functions isn't ready at this point
@@ -286,20 +287,29 @@ struct CAT : public FunctionPass {
         
     }
 
+    bool runOnModule(Module &M) override{
+            CallGraph &CG;
+
+            // After inline
+            for(auto &F: M){
+                if(!F.empty())
+                    runOnFunction(F);
+            }
+            return false;
+        }
+
 
     // This function is invoked once per function compiled
     // The LLVM IR of the input functions is ready and it can be analyzed and/or transformed
-    bool runOnFunction (Function &F) override {
-        //findCatVariables(F);
-        //phi_node_new2set(F);
-        AliasAnalysis & AA = getAnalysis<AAResultsWrapperPass>().getAAResults();
+    bool runOnFunction (Function &F){
+        AliasAnalysis & AA = getAnalysis<AAResultsWrapperPass>(F).getAAResults();
 
         build_store_table(F);
 
         H0_init();
         H0_function_count(F);
         // H0_output(caller_name);
-
+        //errs()<<"IN FUNCTION:"<<F.getFunction().getName()<<"\n";
         sGEN_sKILL_init();
         mptGEN_KILL(F);
         mptIN_OUT(F);
@@ -307,6 +317,7 @@ struct CAT : public FunctionPass {
         sIN_sOUT(F);
         sIN_OUT_inst(F);
         constant_folding(F, AA);
+        //errs()<<"AFTER FOLDING:\n";
 
 
         sGEN_sKILL_init();
@@ -317,22 +328,6 @@ struct CAT : public FunctionPass {
         sIN_OUT_inst(F);
         constant_propagation(F, AA);
 
-//        sGEN_sKILL_init();
-//        mptGEN_KILL(F);
-//        mptIN_OUT(F);
-//        sGEN_sKILL(F, AA);
-//        sIN_sOUT(F);
-//        sIN_OUT_inst(F);
-//        constant_folding(F, AA);
-//
-//        sGEN_sKILL_init();
-//        mptGEN_KILL(F);
-//        mptIN_OUT(F);
-//        sGEN_sKILL(F, AA);
-//        sIN_sOUT(F);
-//        sIN_OUT_inst(F);
-//        constant_propagation(F, AA);
-    //    constant_propagation(F);
         return false;
     }
 
@@ -367,49 +362,6 @@ struct CAT : public FunctionPass {
         ptr2AliasPtrs.clear();
 
     }
-        Value * must_point2(Instruction * instr, Value * ptr) {
-            std::vector<Value *> vals;
-            for (auto &pv: mptIN[instr]) {
-                if (pv.first == ptr) {
-                    vals.push_back(pv.second);
-                }
-            }
-
-            if(vals.size() != 1) return NULL;
-
-            return vals[0];
-        }
-/**
-     *  Given call instruction on CAT_set, CAT_add, CAT_sub
-     *      find target of operation
-     * */
-        Value * get_define_target(CallInst * call_instr) {
-
-            Value * key = NULL;
-            Value * arg0 = call_instr->getArgOperand(0);
-            if (IS_CAT_new(get_callee_ptr(arg0)) ) {
-                /**
-                 *  First argument is a CAT_new call
-                 * */
-                key = arg0;
-
-            } else if (isa<PHINode>(arg0)) {
-                key = arg0;
-
-            } else if (isa<Argument>(arg0)) {
-                key = arg0;
-
-            } else if (isa<LoadInst>(arg0)) {
-                LoadInst * loadInst = cast<LoadInst>(arg0);
-                Value * ptr = loadInst->getPointerOperand();
-                Value * val = must_point2(call_instr, ptr);
-
-                key = val ? val : arg0;
-            }
-
-            return key;
-        }
-
 
     void findCATVar(Function &F){
             cat_var.clear();
@@ -431,6 +383,21 @@ struct CAT : public FunctionPass {
                         cat_var.insert(arg);
                     }
 
+                }
+            }
+        }
+
+        void findPtrAlias(Value* instr, Value * p){
+            PHINode *phi = cast<PHINode>(p);
+            int num_val = phi->getNumIncomingValues();
+            for(auto i=0;i<num_val;i++){
+                Value * m_ptr = phi->getIncomingValue(i);
+                store_table[p].insert(m_ptr);
+
+                ptr2AliasPtrs[instr].insert(m_ptr);
+                ptr2AliasPtrs[m_ptr].insert(instr);
+                if(isa<PHINode>(m_ptr)){
+                    findPtrAlias(instr, m_ptr);
                 }
             }
         }
@@ -459,8 +426,18 @@ struct CAT : public FunctionPass {
                         int num_arg = selectInst->getNumOperands();
                         for(auto i=1;i<num_arg;i++){
                             Value *aPtr = selectInst->getOperand(i);
+
                             ptr2AliasPtrs[aPtr].insert(&inst);
                             ptr2AliasPtrs[&inst].insert(aPtr);
+                            ptr2AliasPtrs[&inst].insert(&inst);
+
+                            store_table[&inst].insert(aPtr);
+                            if(isa<PHINode>(aPtr)){
+                                findPtrAlias(&inst,aPtr);
+                            }
+                        }
+                        for(auto& item:ptr2AliasPtrs[&inst]){
+                            //errs()<<"SELECT:"<<*item<<"\n";
                         }
                     }
                 }
@@ -481,7 +458,7 @@ struct CAT : public FunctionPass {
                         // then KILL all (p,x) (q,x) (r,x)
                         for(auto& alias:ptr2AliasPtrs){
                             if(IN_SET(alias.second,ptrOperand)){
-                                errs()<<"FIND:ALIAS "<< *alias.first<<"\n";
+                                //errs()<<"FIND:ALIAS "<< *alias.first<<"\n";
                                 // first
                                 for(auto& e:allValue){
                                     mptKILL[&inst].insert(std::make_pair(alias.first,e));
@@ -555,7 +532,7 @@ struct CAT : public FunctionPass {
                         //FIXME:
                         // If store, remember the must alias table
                         if(isa<LoadInst>(&inst)){
-                            errs()<<inst<<"\n";
+                            //errs()<<inst<<"\n";
                             LoadInst* loadInst = cast<LoadInst>(&inst);
                             Value* ptr = loadInst->getPointerOperand();
                             // find if (loadRoot,x) in mptIN
@@ -564,7 +541,7 @@ struct CAT : public FunctionPass {
                                 //find
                                 if(ptr==pr.first){
                                     temp.insert(pr);
-                                    errs()<<*pr.first<<" ,"<<*pr.second<<"\n";
+                                   // errs()<<*pr.first<<" ,"<<*pr.second<<"\n";
                                 }
                             }
 
@@ -608,47 +585,6 @@ struct CAT : public FunctionPass {
                                 changed = (local_OUT!=mptOUT[&inst]);
                             }
                         }
-
-
-                        if(isa<SelectInst>(&inst)){
-
-                           /*
-                            std::set<std::pair<Value*,Value*>> temp;
-                            for(int i=0;i<num_arg;i++){
-                                Value* q = selectInst->getOperand(i);
-                                for(auto& item:mptIN[&inst]){
-                                    if(item.first==q){
-                                        temp.insert(std::make_pair(&inst,item.second));
-                                    }
-                                }
-                            }
-
-                            std::set<std::pair<Value*,Value*>> all_x;
-                            for(auto& x:cat_var){
-                                all_x.insert(std::make_pair(&inst,x));
-                            }
-
-                            std::set<std::pair<Value*,Value*>> diff;
-
-                            set_diff(mptIN[&inst],all_x,diff);
-
-                            std::set<std::pair<Value*,Value*>> out;
-
-                            set_union(temp,diff,out);
-
-                            if(!changed){
-                                changed = (out!=mptOUT[&inst]);
-                            }
-                            local_OUT = out;
-                            errs()<<"SELECT INST\n";
-                            for(auto& item:out){
-
-                                errs()<<*item.first<<"  "<<*item.second<<"\n";
-                            }
-                            */
-                        }
-
-
                         mptOUT[&inst] = local_OUT;
                     }
                     mptBB_OUT[&BB]=local_OUT;
@@ -681,8 +617,6 @@ struct CAT : public FunctionPass {
 
         sGEN.insert(dummy);
         sVar2Def[val].insert(dummy);
-
-        
     }
 
 
@@ -751,12 +685,15 @@ struct CAT : public FunctionPass {
                          * */
                         if (isa<PointerType>(arg->getType())) {
                             std::vector<Value *> possible_vals;
-                            ptr_trace_back(arg, possible_vals);
+                            //ptr_trace_back(arg, possible_vals);
+                            std::set<Value*> visited;
+                            catVarTraceBack(arg, possible_vals,visited);
 
                             for (uint32_t j = 0; j < possible_vals.size(); j++) {
 
                                     MemoryLocation memLoc(possible_vals[j]);
-                                    ModRefInfo info = AA.getModRefInfo(call_instr, memLoc); 
+                                    ModRefInfo info = AA.getModRefInfo(call_instr, memLoc);
+                                    errs()<<"Possible vals:"<<*possible_vals[j]<<"\n";
 
 
                                     errs() << *call_instr << " has arg " << *arg << " at " << arg << " ModRefInfo = " << ModRefInfo_toString(info) <<'\n';
@@ -1110,16 +1047,6 @@ struct CAT : public FunctionPass {
                     if (callee_name != "CAT_get") {
                         
                         GEN.set(i);
-
-                        // if (callee_name == "CAT_new") {
-                        //     instr2bitmap[call_instr] = llvm::BitVector(NumInstrs, 0);
-                        //     instr2bitmap[call_instr].set(i);
-                        // } else {
-                        //     // get first operand if CAT_set, CAT_add, CAT_sub
-                        //     void * arg0 = call_instr->getArgOperand(0);
-                        //     errs()<< arg0 << "\n";
-                        //     instr2bitmap[arg0].set(i);
-                        // }
                         void * key;
                         if (callee_name == "CAT_new") {
                             key = call_instr;
@@ -1311,6 +1238,46 @@ struct CAT : public FunctionPass {
             }
         }
     }
+    void catVarTraceBack(Value *ptr, std::vector<Value*>& possible_val, std::set<Value*>& visited){
+        //errs()<<"LOOKING INTO "<<*ptr<<"\n";
+        visited.insert(ptr);
+        if(IS_CAT_VAR(ptr)){
+            possible_val.push_back(ptr);
+            visited.insert(ptr);
+            return;
+        }
+
+        if(isa<SelectInst>(ptr)){
+            SelectInst *selectInst = cast<SelectInst>(ptr);
+            int num_arg = selectInst->getNumOperands();
+            for(auto i=1;i<num_arg;i++){
+                Value *arg = selectInst->getOperand(i);
+                if(IN_SET(visited,arg))
+                    continue;
+                catVarTraceBack(arg,possible_val,visited);
+            }
+        }
+
+        if(isa<PHINode>(ptr)){
+            PHINode *phiNode = cast<PHINode>(ptr);
+            int num_arg = phiNode->getNumIncomingValues();
+            for(auto i=0;i<num_arg;i++){
+                Value *arg = phiNode->getIncomingValue(i);
+                if(IN_SET(visited,arg))
+                    continue;
+                catVarTraceBack(arg,possible_val,visited);
+            }
+        }
+
+        if(IN_MAP(ptr2Val,ptr)){
+            //errs()<<*ptr<<"IN MAP\n";
+            for(auto &val:ptr2Val[ptr]){
+                catVarTraceBack(val,possible_val,visited);
+            }
+        }
+
+        return;
+    }
 
     void ptr_trace_back(Value * ptr, std::vector<Value *> & possible_val){
         if (IN_STORE_TABLE(ptr)) {
@@ -1320,7 +1287,7 @@ struct CAT : public FunctionPass {
         } else {
             possible_val.push_back(ptr);
         }
-        
+
     }
 
     void build_store_table(Function & F) {
