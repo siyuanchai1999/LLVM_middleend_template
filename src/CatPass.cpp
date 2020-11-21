@@ -29,7 +29,8 @@ using namespace llvm;
 
 namespace {
 
-struct CAT : public ModulePass {
+// struct CAT : public ModulePass {
+struct CAT : public FunctionPass {
     static char ID; 
     Module *currentModule;
 
@@ -273,8 +274,8 @@ struct CAT : public ModulePass {
 
 
         // class to represent a disjoint set
-        CAT() : ModulePass(ID) {}
-
+        // CAT() : ModulePass(ID) {}
+        CAT() : FunctionPass(ID) {}
     // This function is invoked once at the initialization phase of the compiler
     // The LLVM IR of functions isn't ready at this point
     bool doInitialization (Module &M) override {
@@ -297,79 +298,56 @@ struct CAT : public ModulePass {
 
     // This function is invoked once per function compiled
     // The LLVM IR of the input functions is ready and it can be analyzed and/or transformed
-    bool runOnModule (Module &M) override {
+    // bool runOnModule (Module &M) override {
         
-        CallGraph &CG = getAnalysis<CallGraphWrapperPass>().getCallGraph();
+    //     CallGraph &CG = getAnalysis<CallGraphWrapperPass>().getCallGraph();
         
-        bool inlined = function_inline(M, CG);
+    //     bool inlined = function_inline(M, CG);
 
-        if (!inlined){
-            for (Function & F: M){
-                if (!F.empty() 
-                    // && F.getName().str() == "main"
-                ){
-                    AliasAnalysis & AA = getAnalysis<AAResultsWrapperPass>(F).getAAResults();
+    //     if (!inlined){
+    //         for (Function & F: M){
+    //             if (!F.empty() 
+    //                 // && F.getName().str() == "main"
+    //             ){
+    //                 AliasAnalysis & AA = getAnalysis<AAResultsWrapperPass>(F).getAAResults();
 
-                    mpt_wrap(F, AA);
-                    reachingDef_wrap(F, AA);
-                    bool folded = constant_folding(F, AA);
+    //                 mpt_wrap(F, AA);
+    //                 reachingDef_wrap(F, AA);
+    //                 bool folded = constant_folding(F, AA);
 
-                    if (!folded){
-                        mpt_wrap(F, AA);
-                        reachingDef_wrap(F, AA);
-                        constant_propagation(F, AA);
-                    }
+    //                 if (!folded){
+    //                     mpt_wrap(F, AA);
+    //                     reachingDef_wrap(F, AA);
+    //                     constant_propagation(F, AA);
+    //                 }
                     
 
-                    // for (BasicBlock & BB: F) {
-                    //     errs() << BB; 
-                    // }
-                }
-            }
-        }
-        return false;
-    }
+    //                 // for (BasicBlock & BB: F) {
+    //                 //     errs() << BB; 
+    //                 // }
+    //             }
+    //         }
+    //     }
+    //     return false;
+    // }
 
     // // This function is invoked once per function compiled
     // // The LLVM IR of the input functions is ready and it can be analyzed and/or transformed
-    // bool runOnFunction (Function &F) override {
-    //     //findCatVariables(F);
-    //     //phi_node_new2set(F);
-    //     AliasAnalysis & AA = getAnalysis<AAResultsWrapperPass>().getAAResults();
-    //     CallGraph &CG = getAnalysis<CallGraphWrapperPass>().getCallGraph();
-    //     mpt_wrap(F, AA);
-    //     reachingDef_wrap(F, AA);
-    //     constant_folding(F, AA);
+    bool runOnFunction (Function &F) override {
+        //findCatVariables(F);
+        //phi_node_new2set(F);
+        AliasAnalysis & AA = getAnalysis<AAResultsWrapperPass>().getAAResults();
+        mpt_wrap(F, AA);
+        reachingDef_wrap(F, AA);
+        constant_folding(F, AA);
 
-    //     mpt_wrap(F, AA);
-    //     reachingDef_wrap(F, AA);
-    //     constant_propagation(F, AA);
-    //     // sGEN_sKILL_init();
-    //     // mptGEN_KILL(F, AA);
-    //     // mptIN_OUT(F);
-    //     // // print_mpt_INOUT(F);
-
-    //     // sGEN_sKILL(F, AA);
-    //     // //print_gen_kill(caller_name,F);
-    //     // sIN_sOUT(F);
-    //     // sIN_OUT_inst(F);
-    //     // // print_in_out(F);
-
+        mpt_wrap(F, AA);
+        reachingDef_wrap(F, AA);
+        constant_propagation(F, AA);
         
-    //     // constant_folding(F, AA);
-
-    //     // sGEN_sKILL_init();
-    //     // mptGEN_KILL(F, AA);
-    //     // mptIN_OUT(F);
-
-
-    //     // sGEN_sKILL_init();
-    //     // sGEN_sKILL(F, AA);
-    //     // sIN_sOUT(F);
-    //     // sIN_OUT_inst(F);
-    //     // constant_propagation(F, AA);
-    //     return false;
-    // }
+        live_analysis_wrapper(F, AA);
+        return false;
+    }
 
     // We don't modify the program, so we preserve all analyses.
     // The LLVM IR of functions isn't ready at this point
@@ -2657,7 +2635,236 @@ struct CAT : public ModulePass {
             }
         }
     }
-};
+
+    std::map<Value *, std::set<Value *>> live_GEN, live_KILL;
+    std::map<Value *, std::set<Value *>> live_IN, live_OUT;
+
+    void live_analysis_init() {
+        // std::map<Value *, std::set<Value *>> live_GEN, live_KILL;
+        // std::map<Value *, std::set<Value *>> live_IN, live_OUT;
+        
+        live_GEN.clear();
+        live_KILL.clear();
+        live_IN.clear();
+        live_OUT.clear();
+    }
+
+    void live_analysis_GENKILL(Function & F, AliasAnalysis & AA ){
+        unsigned NumInstrs = F.getInstructionCount();
+
+        for (BasicBlock &bb : F){
+            for(Instruction &inst : bb){
+                Function * fptr = get_callee_ptr(&inst);
+                if(fptr){
+                    CallInst * call_instr = cast<CallInst>(&inst);
+                    if (IS_CAT_OP(fptr)){
+                        // errs() << "analyzing " << *call_instr << '\n';
+                        if (IS_CAT_new(fptr)){
+                            // only define but not killed
+                            live_KILL[&inst].insert(&inst);
+                            
+                        } else if (IS_CAT_get(fptr)) {
+                            // only use variable, CAT_get
+                            Value * arg0 = call_instr->getArgOperand(0);
+                            live_GEN[&inst].insert(arg0);
+
+
+                            // also define itself for printf usage
+                            // live_KILL_INST[&inst].insert(&inst);
+                        } else if (IS_CAT_set(fptr)) {
+                            // CAT_set, define and usearg0
+                            
+                            // Instruction * arg0 = cast<Instruction>(call_instr->getArgOperand(0));
+                            Value * arg0 = call_instr->getArgOperand(0);
+
+                            live_KILL[&inst].insert(arg0);
+
+                        } else {
+                            // CAT_add, CAT_sub
+                            // define arg0
+                            // use arg1, arg2
+
+                            Value * arg0 = call_instr->getArgOperand(0);
+                            Value * arg1 = call_instr->getArgOperand(1);
+                            Value * arg2 = call_instr->getArgOperand(2);
+
+                            live_KILL[&inst].insert(arg0);
+                            live_GEN[&inst].insert(arg1);
+                            live_GEN[&inst].insert(arg2);
+                        }   
+
+                    } else if (IS_USER_FUNC(fptr)){
+                        // Other function? 
+                        uint32_t arg_cnt = call_instr->getNumArgOperands();
+                        for(uint32_t i = 0; i < arg_cnt; i++){
+                            Value * arg = call_instr->getArgOperand(i);
+                            // if (isa<Instruction>(arg)){
+                            //     // Possibly use and define at the same time
+                            //     Instruction * arg_inst = cast<Instruction>(arg);
+
+                            //     live_KILL_INST[&inst].insert(arg_inst);
+                            //     live_GEN_INST[&inst].insert(arg_inst);
+                            // } else {
+                            //     // argument? 
+                            //     // constant??
+                            // }
+                        
+                            live_KILL[&inst].insert(arg);
+                            live_GEN[&inst].insert(arg);
+
+                        }
+                    } else {
+                        /**
+                         *  Non user function, should not matter at current stage
+                         * */
+                    
+                    }
+                }
+            }
+        }
+
+        // errs() << "live_analysis_GENKILL_INST done \n";
+        // errs() << "printing reference variables\n";
+        // print_set_reference(referenced_var);
+    }
+
+    bool calc_live_OUT2IN(Instruction * inst) {
+        std::set<Value *> tempIN;
+         /**
+             *  p = &x;
+             *  IN[i] = GEN[i] U (OUT[i] – KILL[i])
+             * */
+        std::set<Value *> outMinusKill;
+        set_diff(
+            live_OUT[inst],   /* srcA */
+            live_KILL[inst],  /* srcB */
+            outMinusKill      /* target */
+        );
+
+        set_union(
+            outMinusKill,   /* srcA */
+            live_GEN[inst], /* srcB */
+            tempIN          /* target */
+        );
+
+        bool diff = tempIN != live_IN[inst];
+        live_IN[inst] = tempIN;
+        return diff;
+    }
+
+    void live_analysis_INOUT(Function & F) {
+        std::set<BasicBlock *> bb_calced;
+
+        bool changed;
+        do {
+            changed = false;
+            for (BasicBlock & bb : F) {
+                Instruction * last_inst = bb.getTerminator(); 
+                
+                /**
+                 *  Calculate OUT of last instruction from IN of successors
+                 * */
+                for (BasicBlock * succBB : successors(&bb)) {
+                    Instruction * predBB_terminator = &succBB->front();
+
+                    live_OUT[last_inst].insert(
+                        live_IN[predBB_terminator].begin(),
+                        live_IN[predBB_terminator].end()
+                    );
+                }
+
+                bool last_in_changed = calc_live_OUT2IN(last_inst);
+                
+                if (!changed) changed = last_in_changed;
+
+                if (last_in_changed  || !IN_SET(bb_calced, &bb)) {
+                    bool in_changed;
+                    std::set<Value *> nextIN = live_IN[last_inst];
+
+                    for (auto iter = (++bb.rbegin()); iter != bb.rend(); iter++) {
+                        Instruction * cur_ptr = &*iter;
+                        live_OUT[cur_ptr] = nextIN;
+
+                        in_changed = calc_live_OUT2IN(cur_ptr);
+
+                        nextIN = live_IN[cur_ptr];
+                    }
+
+                    if (!changed) changed = in_changed;
+                    bb_calced.insert(&bb);
+                } 
+
+            }
+
+        } while(changed);
+    }
+
+    bool eliminating(Function &F, AliasAnalysis & AA) {
+
+        return false;
+    }
+
+    void print_live_GENKILL(Function &F){
+        errs() << "Function \"" << F.getName() << "\" " << '\n';
+        for (BasicBlock &bb : F){
+            for(Instruction &inst : bb){
+                errs() << "INSTRUCTION: " << inst << '\n';
+                errs() << "***************** live GEN\n{\n";
+                // print_set(sIN[&inst]);
+                print_set_with_addr(live_GEN[&inst]);
+                errs() << "}\n";
+                errs() << "**************************************\n";
+                errs() << "***************** live KILL\n{\n";
+
+
+                // print_set(sOUT[&inst]);
+                print_set_with_addr(live_KILL[&inst]);
+                errs() << "}\n";
+                errs() << "**************************************\n";
+                errs() << "\n\n\n";
+            }
+        }
+
+    }
+
+    void print_live_INOUT(Function &F){
+        errs() << "Function \"" << F.getName() << "\" " << '\n';
+        for (BasicBlock &bb : F){
+            for(Instruction &inst : bb){
+                errs() << "INSTRUCTION: " << inst << '\n';
+                errs() << "***************** live IN\n{\n";
+                // print_set(sIN[&inst]);
+                print_set_with_addr(live_IN[&inst]);
+                errs() << "}\n";
+                errs() << "**************************************\n";
+                errs() << "***************** live OUT\n{\n";
+
+
+                // print_set(sOUT[&inst]);
+                print_set_with_addr(live_OUT[&inst]);
+                errs() << "}\n";
+                errs() << "**************************************\n";
+                errs() << "\n\n\n";
+            }
+        }
+
+    }
+
+    void live_analysis_wrapper(Function &F, AliasAnalysis & AA){
+        errs() << "liveness Analysis on " << F.getName() << '\n';
+        live_analysis_init();
+        live_analysis_GENKILL(F, AA);
+        live_analysis_INOUT(F);
+
+        print_live_GENKILL(F);
+        print_live_INOUT(F);
+        
+
+        errs() << "Done: liveness Analysis on " << F.getName() << '\n';
+    }
+    
+    // eliminating(F, AA);
+};  
 }
 
 // Next there is code to register your pass to "opt"
