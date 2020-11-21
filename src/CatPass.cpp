@@ -49,7 +49,7 @@ struct CAT : public ModulePass {
     Function * CAT_sub_ptr;
     Function * CAT_get_ptr;
     Function * CAT_set_ptr;
-
+    Function * main_fptr;
 #define IS_CAT_new(fptr) (fptr == CAT_new_ptr)
 #define IS_CAT_add(fptr) (fptr == CAT_add_ptr)
 #define IS_CAT_sub(fptr) (fptr == CAT_sub_ptr)
@@ -113,8 +113,9 @@ struct CAT : public ModulePass {
 
     enum CycleResult {noCycle, mustCycle, mightCycle};
     std::unordered_map<Value *, CycleResult> func2cycle;
-#define IS_PTR_TYPE(val) (isa<PointerType>(val->getType()) )
 
+#define IS_PTR_TYPE(val) (isa<PointerType>(val->getType()) )
+#define IS_INT_TYPE(val) (isa<IntegerType>(val->getType()) )
 #define HAS_MOD(info) (\
         info == ModRefInfo::MustMod \
     || info == ModRefInfo::MustModRef \
@@ -289,7 +290,7 @@ struct CAT : public ModulePass {
             if (str == "CAT_get") {CAT_get_ptr = fptr;}
             if (str == "CAT_set") {CAT_set_ptr = fptr;}
         }
-
+        main_fptr = M.getFunction(StringRef("main"));
         return false;
         
     }
@@ -311,15 +312,18 @@ struct CAT : public ModulePass {
 
                     mpt_wrap(F, AA);
                     reachingDef_wrap(F, AA);
-                    constant_folding(F, AA);
+                    bool folded = constant_folding(F, AA);
 
-                    mpt_wrap(F, AA);
-                    reachingDef_wrap(F, AA);
-                    constant_propagation(F, AA);
-
-                    for (BasicBlock & BB: F) {
-                        errs() << BB; 
+                    if (!folded){
+                        mpt_wrap(F, AA);
+                        reachingDef_wrap(F, AA);
+                        constant_propagation(F, AA);
                     }
+                    
+
+                    // for (BasicBlock & BB: F) {
+                    //     errs() << BB; 
+                    // }
                 }
             }
         }
@@ -504,6 +508,15 @@ struct CAT : public ModulePass {
         return inlined;
     }
 
+    void get_used_function(
+        Module & M, 
+        CallGraph & CG, 
+        std::set<Function *> & used_functions
+    ) {
+        
+
+    }
+
         //naive GEN KILL IN OUT
     void sGEN_sKILL_init() {
         // std::vector<Value*> sGEN;
@@ -559,6 +572,8 @@ struct CAT : public ModulePass {
 
 
     void mptGEN_KILL(Function &F, AliasAnalysis & AA){
+
+        // errs() << "Start: MPT GenKILL for " << F.getName() << '\n'; 
         findCATVar(F);
 
         std::unordered_map<Value *,std::set< Value *>> mpt_gen2ptr;
@@ -662,6 +677,7 @@ struct CAT : public ModulePass {
             
         }
         
+        // errs() << "Done: MPT GenKILL for " << F.getName() << '\n';
     }
 
     /**
@@ -890,9 +906,11 @@ struct CAT : public ModulePass {
     }
 
     void mpt_wrap(Function &F, AliasAnalysis & AA) {
+        errs() << "MPT Analysis on " << F.getName() << '\n';
         mpt_init();
         mptGEN_KILL(F, AA);
         mptIN_OUT(F);
+        errs() << "Done: MPT Analysis on " << F.getName() << '\n';
     }
         
     /**
@@ -1278,13 +1296,20 @@ struct CAT : public ModulePass {
         }
     }
     
+    void reachingDef_cleanup() {
+        for (auto & dummy_userCall : replace2userCall) {
+            // dummy_userCall.first->eraseFromParent(); 
+        }   
+    }
     void reachingDef_wrap(Function &F, AliasAnalysis & AA) {
+        errs() << "Reaching definition on " << F.getName() << '\n';
         sGEN_sKILL_init();
         sGEN_sKILL(F, AA);
         //print_gen_kill(caller_name,F);
         sIN_sOUT(F);
         sIN_OUT_inst(F);
         // print_in_out(F);
+        errs() << "Done: Reaching definition on " << F.getName() << '\n';
     }
     
 
@@ -1772,6 +1797,41 @@ struct CAT : public ModulePass {
         return const_phi;
     }
 
+    PHINode * create_artificial_phi (std::vector<Value *> & temp_vals, std::vector<BasicBlock *> & BBs) {
+        
+
+        Type * llvm_int64 =  IntegerType::get(currentModule->getContext(), 64);
+
+        PHINode * artificial_phi = PHINode::Create(
+            llvm_int64,
+            temp_vals.size(),
+            "artificial_phi"
+        );
+
+        for (uint32_t i = 0; i < temp_vals.size(); i++) {
+            artificial_phi->addIncoming(
+                temp_vals[i],
+                BBs[i]
+            );
+        }
+        errs() << "Creating artificial_phi " << *artificial_phi  << " at " << artificial_phi << '\n';
+        return artificial_phi;
+    }
+
+    CallInst * create_CAT_get (Value * var) {
+        Type * llvm_int64 =  IntegerType::get(currentModule->getContext(), 64);
+        
+        ArrayRef<Value *> arg_arr_ref{
+            var
+        };
+        
+        CallInst * cat_get = CallInst::Create(
+            CAT_get_ptr, 
+            var
+        );
+        return cat_get;
+    }
+
     Value * build_add_sub(CallInst * call, Value * arg1_val, Value * arg2_val) {
         Function * fptr = call->getCalledFunction();
         IRBuilder<> builder(call);
@@ -2052,7 +2112,10 @@ struct CAT : public ModulePass {
      *  (instruction to be replaced -> (old phi -> set of new phi))
      * */
     std::map<Instruction *, std::map<PHINode *, std::set<PHINode *>>> phi_toInsert;
-
+    /**
+     *  (instruction that needs artificial Phi -> set of Phi)
+     * */
+    std::map<Instruction *, std::set<PHINode *>> arti_phi_toInsert;
     void insert_phi_constant() {
         for (auto & instr_phiPair : phi_toInsert) {
             Instruction * inst = instr_phiPair.first;
@@ -2065,7 +2128,6 @@ struct CAT : public ModulePass {
                      *  Insert a copy of newPhi into the IR
                      * */
                     IRBuilder<> builder(oldPhi);
-                    Type * llvm_int64 =  IntegerType::get(currentModule->getContext(), 64);
 
                     builder.Insert(newPhi);
                 }
@@ -2076,10 +2138,35 @@ struct CAT : public ModulePass {
     void delete_phi_constant(Instruction * inst) {
         for (auto & old_news : phi_toInsert[inst]) {
             for (PHINode * newPhi : old_news.second) {
+                errs() << "deleting constant phi" << *newPhi << " at " << newPhi << '\n';
                 delete newPhi;
             }
         }
         phi_toInsert.erase(inst);
+    }
+
+    /**
+     *  Should be at the top of the BB
+     * */
+    void insert_phi_artificial() {
+        for (auto & inst_phi : arti_phi_toInsert) {
+            Instruction * inst = inst_phi.first;
+            BasicBlock * parent = inst->getParent();
+            Instruction * head = &parent->front();
+            for (PHINode * phi : inst_phi.second) {
+                
+                IRBuilder<> builder(head);
+                builder.Insert(phi);
+            }
+        }
+    }
+
+    void delete_phi_artificial(Instruction * inst) {
+        for (auto & art_phi : arti_phi_toInsert[inst]) {
+            errs() << "deleting artificial phi " << *art_phi << " at " << art_phi << '\n';
+            delete art_phi;
+        }
+        arti_phi_toInsert.erase(inst);
     }
 
     bool VAL_check_constant_AA_wrap(
@@ -2166,7 +2253,11 @@ struct CAT : public ModulePass {
     }
 
     bool VAL_check_constant_s(Instruction * instr, Value * arg, BasicBlock * incomingBB, Value ** res) {
-        
+        if (isa<IntegerType>(arg->getType())) {
+            *res = arg;
+            return true;
+        }
+
         /**
          * Find the intersection between reaching definition of instr and definitions that define arg
         */
@@ -2175,15 +2266,15 @@ struct CAT : public ModulePass {
         set_union(sVar2Def[arg], sVar2mightDef[arg], arg_defs);
         set_intersect(sIN[instr], arg_defs, arg_defs);
 
-        errs() << "arg_defs of " << *arg  <<  " at " << *instr << " = \n";
-        print_set_with_addr(arg_defs);
+        // errs() << "arg_defs of " << *arg  <<  " at " << *instr << " = \n";
+        // print_set_with_addr(arg_defs);
 
         if (incomingBB) {
             set_intersect(sBB_OUT[incomingBB], arg_defs, arg_defs);
         }
 
-        errs() << "arg_defs of " << *arg  <<  " at " << *instr << " = \n";
-        print_set_with_addr(arg_defs);
+        // errs() << "arg_defs of " << *arg  <<  " at " << *instr << " = \n";
+        // print_set_with_addr(arg_defs);
         
         // errs() << "sVar2mightDef[arg] = \n";
         // print_set_with_addr(sVar2mightDef[arg]);
@@ -2196,7 +2287,15 @@ struct CAT : public ModulePass {
          * Expected vector of constants
          * */
         std::vector<Value *> const_vec (arg_defs.size());
+        std::vector<BasicBlock *> def_bb;
         uint32_t idx = 0;
+
+        BasicBlock * inst_parent = instr->getParent();
+        
+        std::set<BasicBlock *> preds_set;
+        for (BasicBlock * pred : predecessors(inst_parent)) {
+            preds_set.insert(pred);
+        }
 
         for (auto & def : arg_defs) {
             bool is_const = false;
@@ -2208,11 +2307,17 @@ struct CAT : public ModulePass {
             }   
             
             /**
-             * false immediately if one any of the definition is not a constant
+             *   false immediately if one any of the definition is not a constant
              * */
             if (!is_const) return false;
             
             // errs() << "const = " << *const_vec[idx] << '\n';
+            if (isa<Instruction>(def) && const_vec[idx] != instr) {
+                BasicBlock * def_parent = cast<Instruction>(def)->getParent();
+                if (IN_SET(preds_set, def_parent)) {
+                    def_bb.push_back(def_parent);
+                }
+            }
             idx++;
         }   
         
@@ -2222,10 +2327,24 @@ struct CAT : public ModulePass {
             *res = const_vec[0];
             
             return true;
+        } 
+        
+        std::set<BasicBlock *> def_bb_set(def_bb.begin(), def_bb.end());
+        // errs() << "def_bb_set.size() = " << def_bb_set.size() << " def_bb.size() = " << def_bb.size() << '\n';
+        if (
+                def_bb.size() == const_vec.size()
+            &&  def_bb.size() == def_bb_set.size()
+        ) {
+            /**
+             *  Continue if every def comes from a different branches
+             * */
+            PHINode * artificial_phi = create_artificial_phi(const_vec, def_bb);
+            arti_phi_toInsert[instr].insert(artificial_phi);
+            *res = artificial_phi;
+            return true;
         }
 
         return false;
-
     }
     /**
      *  check if given @val defines a constant
@@ -2318,6 +2437,19 @@ struct CAT : public ModulePass {
         return false; 
     }
 
+    /**
+     *  Location to be inserted -> instruction to be inserted
+     * */
+    void build_from_map(std::map<Instruction *, Instruction *> & loc2newInst) {
+        for (auto & loc_newInst : loc2newInst) {
+            Instruction * location = loc_newInst.first;
+            Instruction * newInst = loc_newInst.second;
+
+            IRBuilder<> builder(location);
+            builder.Insert(newInst);
+        }
+    }
+
     void replace_from_map(std::unordered_map<llvm::CallInst *, llvm::Value *> & replace_map) {
         for (auto & kv: replace_map) {
             // errs() << "Replacing " << *kv.first << " with " << *kv.second << '\n';
@@ -2333,13 +2465,29 @@ struct CAT : public ModulePass {
 
 
 
-    void constant_folding(Function & F, AliasAnalysis & AA) {
+    bool constant_folding(Function & F, AliasAnalysis & AA) {
         errs() << "Folding on " << F.getName().str() << '\n';
-        unsigned inst_counter = 0;
         std::unordered_map<llvm::CallInst *, Value *> toFold;
+
+        /**
+         *  folding helper: callinst -> (val1, val2)
+         * */
         std::unordered_map<llvm::CallInst *, std::pair<Value *, Value *>> toFold_helper;
 
+        /**
+         *  add instruction -> get instruction before it
+         * */
+        std::map<Instruction *, Instruction *> catGet_beforeAdd;
+        
+        /**
+         *  Keep track of constant Ints that built by ourselves
+         * */
+        std::set<Value *> artificial_const;
+        
+        
         phi_toInsert.clear();
+        arti_phi_toInsert.clear();
+        
         for (BasicBlock &bb : F){
             for(Instruction &inst : bb){
                 if (isa<CallInst>(&inst)) {
@@ -2354,10 +2502,14 @@ struct CAT : public ModulePass {
                         Value * arg1 = call_instr->getArgOperand(1);
                         Value * arg2 = call_instr->getArgOperand(2);
                         if (arg1 == arg2) {
-                            int64_t substitution = 0;
+                            Value * dummy_arg1 = build_constint(0);
+                            Value * dummy_arg2 = build_constint(0);
+                            artificial_const.insert(dummy_arg1);
+                            artificial_const.insert(dummy_arg2);
+
                             toFold_helper[call_instr] = std::make_pair(
-                                build_constint(0),
-                                build_constint(0)
+                                dummy_arg1,
+                                dummy_arg2
                             ) ;
                             continue;
                         }
@@ -2370,22 +2522,6 @@ struct CAT : public ModulePass {
                         Value * arg0 = call_instr->getArgOperand(0);
                         Value * arg1 = call_instr->getArgOperand(1);
                         Value * arg2 = call_instr->getArgOperand(2);
-                        
-                        int64_t arg1_val = 0, arg2_val = 0;
-                        // bool arg1_const = check_constant_s(call_instr, arg1, &arg1_val);
-                        // bool arg2_const = check_constant_s(call_instr, arg2, &arg2_val);
-                        
-                        // bool arg1_const = check_constant_AA_wrap(AA, call_instr, arg1, &arg1_val);
-                        // bool arg2_const = check_constant_AA_wrap(AA, call_instr, arg2, &arg2_val);
-
-                        // int64_t substitution = (IS_CAT_add(callee_ptr) ? arg1_val + arg2_val : arg1_val - arg2_val);
-                        
-                        // if (arg1_const && arg2_const) {
-                        //     // toFold[call_instr] = build_cat_set(call_instr, substitution);
-                            
-                        //     // errs() << "Folding " << *call_instr << " with " << substitution << '\n';
-                        //     toFold_helper[call_instr] = substitution;
-                        // }
 
                         Value * arg1_LLVM_val, * arg2_LLVM_val;
                         bool arg1_const = VAL_check_constant_AA_wrap(AA, call_instr, arg1, &arg1_LLVM_val);
@@ -2397,30 +2533,79 @@ struct CAT : public ModulePass {
                             
                             
                             // Value * substitution = build_add_sub(call_instr, arg1_LLVM_val, arg2_LLVM_val);
-                            // errs() << "Folding " << *call_instr << " with set " << *substitution << '\n';
+                            // errs() << "Folding " << *call_instr << " with set " << *arg1_LLVM_val << " and " << *arg2_LLVM_val <<'\n';
                             toFold_helper[call_instr] = std::make_pair(arg1_LLVM_val, arg2_LLVM_val);
+                            continue;
                         } else {
                             delete_phi_constant(call_instr);
+                            delete_phi_artificial(call_instr);
+                        }
+                        
+                    }
+
+                    if (IS_CAT_add(callee_ptr)) {
+                        Value * arg1 = call_instr->getArgOperand(1);
+                        Value * arg2 = call_instr->getArgOperand(2);
+                        if (arg1 == arg2) {
+                            CallInst * cat_get = create_CAT_get(arg1);
+                            
+                            catGet_beforeAdd[call_instr] = cat_get;
+                            toFold_helper[call_instr] = std::make_pair(
+                                cat_get,
+                                cat_get
+                            );
+                            continue;
                         }
                     }
                 }
-                inst_counter++;
             }
         }
 
+        build_from_map(catGet_beforeAdd);
         insert_phi_constant();
+        insert_phi_artificial();
+
         
+
         for (auto &kv: toFold_helper) {
-            Value * substitution = build_add_sub(kv.first, kv.second.first, kv.second.second);
+            CallInst * callinst = kv.first;
+            Function * fptr = callinst->getCalledFunction();
+            Value * arg1_val = kv.second.first;
+            Value * arg2_val = kv.second.second;
+
+            Value * substitution;
+            if (isa<ConstantInt>(arg1_val) && isa<ConstantInt>(arg2_val)) {
+                ConstantInt * arg1_val_int = cast<ConstantInt>(arg1_val);
+                ConstantInt * arg2_val_int = cast<ConstantInt>(arg2_val);
+                int64_t arg1_int = arg1_val_int->getSExtValue();
+                int64_t arg2_int = arg2_val_int->getSExtValue();
+                
+                int64_t calc_res = 0;
+                if(IS_CAT_add(fptr)) calc_res = arg1_int + arg2_int;
+                if(IS_CAT_sub(fptr)) calc_res = arg1_int - arg2_int;
+
+                substitution = build_constint(calc_res);
+                
+            } else {
+                substitution = build_add_sub(kv.first, arg1_val, arg2_val);
+            }
+
             errs() << "Folding " << *kv.first << " by CATset " << *substitution << " at " << substitution << '\n';
-            toFold[kv.first] = build_cat_set(kv.first, substitution);
+            toFold[callinst] = build_cat_set(callinst, substitution);
         }
+
         replace_from_map(toFold);
+
+        // for (auto & BB: F) {errs() << BB;}
+
+        return toFold.size() != 0;
     }
 
-    void constant_propagation(Function & F, AliasAnalysis & AA) {
+    bool constant_propagation(Function & F, AliasAnalysis & AA) {
         errs() << "Propogate on " << F.getName().str() << '\n';
         phi_toInsert.clear();
+        arti_phi_toInsert.clear();
+
         unsigned inst_counter = 0;
         std::unordered_map<llvm::CallInst *, Value *> toPropogate;
 
@@ -2446,6 +2631,7 @@ struct CAT : public ModulePass {
                         } else {
                             // phi_toInsert.erase(call_instr);
                             delete_phi_constant(call_instr);
+                            delete_phi_artificial(call_instr);
                         }
                     }
                 }
@@ -2453,9 +2639,13 @@ struct CAT : public ModulePass {
         }
 
         insert_phi_constant();
+        insert_phi_artificial();
+
         replace_from_map(toPropogate);
 
+        // for (auto & BB: F) {errs() << BB;}
         // errs() << "Done: constant prop !\n";
+        return toPropogate.size() != 0;
     }
 
     void print_bitvector(BitVector &bv){
