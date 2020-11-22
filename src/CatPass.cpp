@@ -22,6 +22,8 @@
 #include <map>
 #include <unordered_map>
 #include <queue>
+
+// #define CHECK_CONST_AGGRESSIVE 
 using namespace llvm;
  
 #define IN_MAP(map, key) (map.find(key) != map.end())
@@ -2311,13 +2313,15 @@ struct CAT : public ModulePass {
              * */
             if (!is_const) return false;
             
-            // errs() << "const = " << *const_vec[idx] << '\n';
+#ifdef CHECK_CONST_AGGRESSIVE
             if (isa<Instruction>(def) && const_vec[idx] != instr) {
                 BasicBlock * def_parent = cast<Instruction>(def)->getParent();
                 if (IN_SET(preds_set, def_parent)) {
                     def_bb.push_back(def_parent);
                 }
             }
+#endif
+
             idx++;
         }   
         
@@ -2329,6 +2333,7 @@ struct CAT : public ModulePass {
             return true;
         } 
         
+#ifdef CHECK_CONST_AGGRESSIVE
         std::set<BasicBlock *> def_bb_set(def_bb.begin(), def_bb.end());
         // errs() << "def_bb_set.size() = " << def_bb_set.size() << " def_bb.size() = " << def_bb.size() << '\n';
         if (
@@ -2343,6 +2348,7 @@ struct CAT : public ModulePass {
             *res = artificial_phi;
             return true;
         }
+#endif
 
         return false;
     }
@@ -2542,7 +2548,7 @@ struct CAT : public ModulePass {
                         }
                         
                     }
-
+#ifdef CHECK_CONST_AGGRESSIVE
                     if (IS_CAT_add(callee_ptr)) {
                         Value * arg1 = call_instr->getArgOperand(1);
                         Value * arg2 = call_instr->getArgOperand(2);
@@ -2557,6 +2563,7 @@ struct CAT : public ModulePass {
                             continue;
                         }
                     }
+#endif
                 }
             }
         }
