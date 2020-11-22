@@ -311,6 +311,7 @@ struct CAT : public ModulePass {
                     // && F.getName().str() == "main"
                 ){
                     AliasAnalysis & AA = getAnalysis<AAResultsWrapperPass>(F).getAAResults();
+                    CATNewElimination(F);
 
                     mpt_wrap(F, AA);
                     reachingDef_wrap(F, AA);
@@ -321,16 +322,270 @@ struct CAT : public ModulePass {
                         reachingDef_wrap(F, AA);
                         constant_propagation(F, AA);
                     }
-                    
 
-                    // for (BasicBlock & BB: F) {
-                    //     errs() << BB; 
-                    // }
                 }
             }
         }
         return false;
     }
+    class CC{
+    public:
+        std::vector<std::vector<Value*>> cc;
+
+
+    };
+    class Graph{
+#define is_cat_new(fptr) (fptr->getName()=="CAT_new")
+    public:
+        std::map<Value *, std::set<Value *>> g;
+        std::map<PHINode *, std::set<Value *>> visitedPHI;
+        std::set<Value*> visited;
+        CC cc;
+
+        void clear(){
+            g.clear();
+            visited.clear();
+            visitedPHI.clear();
+            cc.cc.clear();
+        }
+
+        void initCATNewGraph(Function &F){
+            this->clear();
+            for(auto& BB: F){
+                for(auto& I: BB){
+                    if(isa<PHINode>(&I)){
+
+                        PHINode *phi = cast<PHINode>(&I);
+
+                        if(!IN_SET(visitedPHI,phi)){
+                            auto count = countCATNewUnderPHI(phi);
+                            if(count>=2)
+                                addEdgeGroup(visitedPHI[phi]);
+                        }
+
+                    }
+                }
+            }
+            findCC();
+            //print_CC();
+        }
+
+        void DFS(Value* valNode, std::vector<Value *> &cc_sub){
+
+            for(auto& nbr : g[valNode]){
+                if(!IN_SET(visited,nbr)){
+                    visited.insert(nbr);
+                    cc_sub.push_back(nbr);
+                    DFS(nbr,cc_sub);
+                }
+            }
+        }
+
+        void findCC(){
+            visited.clear();
+            for(auto &kv:g){
+                if(!IN_SET(visited,kv.first)){
+                    visited.insert(kv.first);
+                    std::vector<Value*> cc_sub;
+                    cc_sub.push_back(kv.first);
+                    DFS(kv.first,cc_sub);
+                    cc.cc.push_back(cc_sub);
+                }
+            }
+
+        }
+
+        void addEdge(Value *a, Value *b){
+            this->g[a].insert(b);
+            this->g[b].insert(a);
+        }
+
+        void addEdgeGroup(std::set<Value*> &catNews){
+            std::vector<Value *> catNewVec(catNews.begin(), catNews.end());
+            for(auto i=1; i < catNewVec.size(); i++){
+                this->addEdge(catNewVec[i],catNewVec[i-1]);
+            }
+        }
+
+        int countCATNewUnderPHI(PHINode *phi){
+            if(IN_SET(visitedPHI,phi)){
+                return visitedPHI[phi].size();
+            }
+            auto numIn = phi->getNumIncomingValues();
+            auto catNewNum = 0;
+            visitedPHI[phi] = std::set<Value *>();
+            for(auto i = 0; i < numIn; i++){
+                Value *inValue = phi->getIncomingValue(i);
+                if(isa<CallInst>(inValue)){
+                    CallInst *callInst = cast<CallInst>(inValue);
+                    Function *callee = callInst->getCalledFunction();
+                    if(is_cat_new(callee)){
+                        visitedPHI[phi].insert(callInst);
+                        catNewNum++;
+                    }
+                }else if(isa<PHINode>(inValue)){
+                    PHINode * childPHI = cast<PHINode>(inValue);
+                    countCATNewUnderPHI(childPHI);
+                    catNewNum += visitedPHI[childPHI].size();
+                    visitedPHI[phi].insert(visitedPHI[childPHI].begin(), visitedPHI[childPHI].end());
+                }else if(isa<Argument>(inValue)&&!isa<ConstantInt>(inValue)){
+                    Argument *arg = cast<Argument>(inValue);
+                    visitedPHI[phi].insert(arg);
+                    catNewNum++;
+                }
+            }
+            return catNewNum;
+        }
+
+            void print_CC(){
+                errs() <<"printing CC\n";
+                for(uint32_t i = 0; i < cc.cc.size(); i++){
+                    errs() <<"#" << i << " CC\n";
+                    for(uint32_t j = 0; j < cc.cc[i].size(); j++){
+                        errs() << *cc.cc[i][j] <<'\n';
+                    }
+                    errs() <<'\n';
+
+                }
+            }
+    };
+        void replace_instr_val(Instruction * instr, Value * val){
+            BasicBlock::iterator ii(instr);
+            BasicBlock * bb = instr->getParent();
+            ReplaceInstWithValue(bb->getInstList(), ii, val);
+        }
+        void CAT_new_to_CAT_set(
+                llvm::Value * CAT_new_old,
+                llvm::Value * CAT_new_replace
+        ) {
+            CallInst *old = cast<CallInst>(CAT_new_old);
+            IRBuilder<> builder(old);
+
+            Value * val = old->getArgOperand(0);
+
+            ArrayRef<Value *> arg_arr_ref = ArrayRef<Value *>{CAT_new_replace, val};
+
+            Value * added_set_instr = builder.CreateCall(CAT_set_ptr, arg_arr_ref);
+
+            // replacement
+            replace_instr_val(old, CAT_new_replace);
+        }
+    void mergePHICATNew(Graph &G, Function &F){
+            for(auto i = 0; i <G.cc.cc.size(); i++){
+                // nodes = G.cc.cc[i]
+                std::set<Value*> nodeSet(G.cc.cc[i].begin(),G.cc.cc[i].end());
+                Value *CAT_new_replace = NULL;
+                for(auto arg=F.arg_begin();arg!=F.arg_end();++arg){
+                    if(IN_SET(nodeSet,arg)){
+                        CAT_new_replace = cast<Value>(arg);
+                        break;
+                    }
+                }
+                for(Instruction & inst: F.getBasicBlockList().front()){
+                    if(IN_SET(nodeSet,&inst)){
+                        CAT_new_replace = cast<Value>(&inst);
+                        break;
+                    }
+                }
+
+                if(CAT_new_replace==NULL) CAT_new_replace = build_CAT_new_Head(F);
+
+                for(auto j = 0; j <G.cc.cc[i].size();j++){
+                    Value * CAT_new_old = cast<Value>(G.cc.cc[i][j]);
+                    if(CAT_new_old != CAT_new_replace){
+                        CAT_new_to_CAT_set(
+                                CAT_new_old,
+                                CAT_new_replace
+                        );
+                    }
+                }
+
+            }
+        }
+
+
+        void CATNewElimination(Function &F){
+        Graph graph;
+        graph.initCATNewGraph(F);
+        mergePHICATNew(graph,F);
+        //graph.initCATNewGraph(F);
+//        errs()<<"?????????????????????????????????????????????????????\n";
+//        for(auto& BB: F){
+//            for(auto& I:BB){
+//                errs()<<I<<"\n";
+//            }
+//        }
+        graph.initCATNewGraph(F);
+//        for(auto& t:graph.visitedPHI){
+//            for(auto& t2: t.second){
+//                errs()<<*t2<<"\n";
+//            }
+//        }
+
+        merge_Phi(graph.visitedPHI);
+
+    }
+        CallInst * build_CAT_new_Head(Function & F){
+            Instruction * first_instr = &(*instructions(F).begin());
+            IRBuilder<> builder(first_instr);
+
+            Constant * zeroConst = ConstantInt::get(IntegerType::get(currentModule->getContext(), 64), 0, true);
+            // std::vector<Value *> arg_vec{zeroConst};
+            ArrayRef<Value *> arg_arr_ref = ArrayRef<Value *>{zeroConst};
+
+            Value * added_new_instr = builder.CreateCall(CAT_new_ptr, arg_arr_ref);
+            return cast<CallInst>(added_new_instr);
+
+        }
+        void merge_Phi(
+                std::map<PHINode *, std::set<Value *>> &visited_phi
+        ){
+            std::set<PHINode *> worklist;
+            bool merged_in_round = true;
+
+            for (auto & kv : visited_phi){
+                worklist.insert(kv.first);
+            }
+            std::set<PHINode *> worklist_temp;
+
+            while (merged_in_round && !worklist.empty())
+            {
+                // create temp as it's hard to erase while iterating
+                worklist_temp = worklist;
+                merged_in_round = false;
+
+                for (auto & phi : worklist){
+                    bool merged = merge_single_phi(phi);
+
+                    if (merged){
+
+                        worklist_temp.erase(phi);
+                    }
+                    merged_in_round = merged_in_round || merged;
+                }
+
+                worklist = worklist_temp;
+            }
+
+        }
+        bool merge_single_phi(PHINode *phi) {
+            // errs() << "replacing" << *phi  << "at " << phi << '\n';
+            uint32_t numIncoming = phi->getNumIncomingValues();
+
+            std::vector<Value *> inValue_collect(numIncoming);
+            for (uint32_t i = 0; i < numIncoming; i++) {
+                inValue_collect[i] = phi->getIncomingValue(i);
+            }
+
+            if (vec_all_equal(inValue_collect)){
+                replace_instr_val(phi, inValue_collect[0]);
+                // errs() <<"after replacement\n";
+                // errs() << phi << '\n';
+                return true;
+            }
+
+            return false;
+        }
 
     // // This function is invoked once per function compiled
     // // The LLVM IR of the input functions is ready and it can be analyzed and/or transformed
