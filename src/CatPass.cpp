@@ -22,7 +22,7 @@
 #include <map>
 #include <unordered_map>
 #include <queue>
-
+#include <chrono>
 // #define CHECK_CONST_AGGRESSIVE 
 using namespace llvm;
  
@@ -299,28 +299,67 @@ struct CAT : public ModulePass {
 
     // This function is invoked once per function compiled
     // The LLVM IR of the input functions is ready and it can be analyzed and/or transformed
+    class Timer{
+    public:
+        std::chrono::time_point<std::chrono::system_clock> t_start;
+        std::chrono::time_point<std::chrono::system_clock> t_stop;
+        void start(){
+            t_start = std::chrono::high_resolution_clock().now();
+        }
+        void stop(){
+            t_stop = std::chrono::high_resolution_clock().now();
+        }
+        void printDuration(std::string const & str){
+            errs()<<str<<":"<<std::chrono::duration_cast<std::chrono::milliseconds>(t_stop - t_start).count()<<" ms\n";
+        }
+    };
     bool runOnModule (Module &M) override {
-        
+        Timer timer;
         CallGraph &CG = getAnalysis<CallGraphWrapperPass>().getCallGraph();
-        
+        timer.start();
         bool inlined = function_inline(M, CG);
-
+        timer.stop();
+        timer.printDuration("INLINE ");
         if (!inlined){
-            for (Function & F: M){
-                if (!F.empty() 
-                    // && F.getName().str() == "main"
+            std::set<Function *> usedFunction;
+            getUsedFunction(CG,M,usedFunction);
+            for (auto & F: usedFunction){
+                if (!F->empty()
                 ){
-                    AliasAnalysis & AA = getAnalysis<AAResultsWrapperPass>(F).getAAResults();
-                    CATNewElimination(F);
+                    errs()<<"IN Function:"<<F->getName()<<"\n";
+                    AliasAnalysis & AA = getAnalysis<AAResultsWrapperPass>(*F).getAAResults();
+//                        timer.start();
+                    CATNewElimination(*F);
+//                        timer.stop();
+//                        timer.printDuration("\tCAT NEW ELIMINATION ");
+//                        timer.start();
+                    mpt_wrap(*F, AA);
+//                        timer.stop();
+//                        timer.printDuration("\tMPT1");
 
-                    mpt_wrap(F, AA);
-                    reachingDef_wrap(F, AA);
-                    bool folded = constant_folding(F, AA);
+//                        timer.start();
+                    reachingDef_wrap(*F, AA);
+//                        timer.stop();
+//                        timer.printDuration("\tREACHING DEF1 ");
+//
+                        timer.start();
+                    bool folded = constant_folding(*F, AA);
+                        timer.stop();
+                        timer.printDuration("\tCONST FOLDING");
 
                     if (!folded){
-                        mpt_wrap(F, AA);
-                        reachingDef_wrap(F, AA);
-                        constant_propagation(F, AA);
+//                            timer.start();
+                        mpt_wrap(*F, AA);
+//                            timer.stop();
+//                            timer.printDuration("\tMPT2 ");
+//                            timer.start();
+                        reachingDef_wrap(*F, AA);
+//                            timer.stop();
+//                            timer.printDuration("\tREACHING DEF2 ");
+                            timer.start();
+                        constant_propagation(*F, AA);
+                            timer.stop();
+                            timer.printDuration("\tPROPAGATION:");
                     }
 
                 }
@@ -328,6 +367,33 @@ struct CAT : public ModulePass {
         }
         return false;
     }
+
+    void getUsedFunction(CallGraph &CG,Module &M,std::set<Function *> &usedFunction){
+        Function *mainF = M.getFunction("main");
+        CallGraphNode *mainNode = CG[mainF];
+        //errs()<<"FUNCTION NAME:\n";
+        usedFunction.insert(mainF);
+        for(auto callee: *mainNode){
+            //errs()<<"NAME:"<<*callee.first<<"\n";
+            if(!callee.second->getFunction()->empty()){
+               getUsedFunctionHelper(callee.second,usedFunction);
+            }
+        }
+    }
+
+    void getUsedFunctionHelper(CallGraphNode *calleeNode, std::set<Function *> &usedFunction){
+        if(IN_SET(usedFunction,calleeNode->getFunction()))
+            return;
+        usedFunction.insert(calleeNode->getFunction());
+        for(auto callee: *calleeNode){
+            if(!callee.second->getFunction()->empty()){
+                getUsedFunctionHelper(callee.second,usedFunction);
+            }
+        }
+    }
+
+
+
     class CC{
     public:
         std::vector<std::vector<Value*>> cc;
@@ -349,7 +415,7 @@ struct CAT : public ModulePass {
             cc.cc.clear();
         }
 
-        void initCATNewGraph(Function &F){
+        void initCATNewGraph(Function &F,std::set<Value*> &arg_set){
             this->clear();
             for(auto& BB: F){
                 for(auto& I: BB){
@@ -358,7 +424,7 @@ struct CAT : public ModulePass {
                         PHINode *phi = cast<PHINode>(&I);
 
                         if(!IN_SET(visitedPHI,phi)){
-                            auto count = countCATNewUnderPHI(phi);
+                            auto count = countCATNewUnderPHI(phi,arg_set);
                             if(count>=2)
                                 addEdgeGroup(visitedPHI[phi]);
                         }
@@ -407,7 +473,7 @@ struct CAT : public ModulePass {
             }
         }
 
-        int countCATNewUnderPHI(PHINode *phi){
+        int countCATNewUnderPHI(PHINode *phi,std::set<Value*> &arg_set){
             if(IN_SET(visitedPHI,phi)){
                 return visitedPHI[phi].size();
             }
@@ -425,12 +491,13 @@ struct CAT : public ModulePass {
                     }
                 }else if(isa<PHINode>(inValue)){
                     PHINode * childPHI = cast<PHINode>(inValue);
-                    countCATNewUnderPHI(childPHI);
+                    countCATNewUnderPHI(childPHI,arg_set);
                     catNewNum += visitedPHI[childPHI].size();
                     visitedPHI[phi].insert(visitedPHI[childPHI].begin(), visitedPHI[childPHI].end());
                 }else if(isa<Argument>(inValue)&&!isa<ConstantInt>(inValue)){
                     Argument *arg = cast<Argument>(inValue);
                     visitedPHI[phi].insert(arg);
+                    arg_set.insert(arg);
                     catNewNum++;
                 }
             }
@@ -506,7 +573,7 @@ struct CAT : public ModulePass {
 
         void CATNewElimination(Function &F){
         Graph graph;
-        graph.initCATNewGraph(F);
+        graph.initCATNewGraph(F,arg_set);
         mergePHICATNew(graph,F);
         //graph.initCATNewGraph(F);
 //        errs()<<"?????????????????????????????????????????????????????\n";
@@ -515,7 +582,7 @@ struct CAT : public ModulePass {
 //                errs()<<I<<"\n";
 //            }
 //        }
-        graph.initCATNewGraph(F);
+        graph.initCATNewGraph(F,arg_set);
 //        for(auto& t:graph.visitedPHI){
 //            for(auto& t2: t.second){
 //                errs()<<*t2<<"\n";
@@ -716,10 +783,10 @@ struct CAT : public ModulePass {
             func2cycle[&F] = f_cycle;
         }
 
-        for (auto & F_cycle : func2cycle) {
-            errs() << F_cycle.first->getName() << " is ";
-            errs() << CycleResult_toString(F_cycle.second) << '\n';
-        }
+//        for (auto & F_cycle : func2cycle) {
+//            errs() << F_cycle.first->getName() << " is ";
+//            errs() << CycleResult_toString(F_cycle.second) << '\n';
+//        }
     }
 
     bool function_inline(Module &M, CallGraph &CG) {
@@ -755,13 +822,13 @@ struct CAT : public ModulePass {
         }
 
         for (CallInst * call: inline_calls) {
-            errs() << "Inlining " << call->getCalledFunction()->getName();
-            errs() << " to " << call->getParent()->getParent()->getName() << "\n";
+            //errs() << "Inlining " << call->getCalledFunction()->getName();
+            //errs() << " to " << call->getParent()->getParent()->getName() << "\n";
             InlineFunctionInfo  IFI;
             inlined |= InlineFunction(call, IFI);
         }
         
-        errs() << "Finish inlining\n";
+        //errs() << "Finish inlining\n";
         return inlined;
     }
 
@@ -1163,11 +1230,19 @@ struct CAT : public ModulePass {
     }
 
     void mpt_wrap(Function &F, AliasAnalysis & AA) {
-        errs() << "MPT Analysis on " << F.getName() << '\n';
+        //errs() << "MPT Analysis on " << F.getName() << '\n';
+            Timer timer;
+            timer.start();
         mpt_init();
         mptGEN_KILL(F, AA);
+            timer.stop();
+            timer.printDuration("\t\tMPT GEN-KILL ");
+
+            timer.start();
         mptIN_OUT(F);
-        errs() << "Done: MPT Analysis on " << F.getName() << '\n';
+            timer.stop();
+            timer.printDuration("\t\tMPT IN-OUT ");
+        //errs() << "Done: MPT Analysis on " << F.getName() << '\n';
     }
         
     /**
@@ -1431,6 +1506,8 @@ struct CAT : public ModulePass {
     }
     void sIN_sOUT(Function &F){
 
+        std::set<BasicBlock *> workList;
+
         /**
          * calculate GEN/KILL for each basic block
          * */
@@ -1439,6 +1516,8 @@ struct CAT : public ModulePass {
             sBB_OUT[&bb] = std::set<Value*>();
             sBB_GEN[&bb] = std::set<Value*>();
             sBB_KILL[&bb] = std::set<Value*>();
+
+            workList.insert(&bb);
 
             for(llvm::Instruction &inst :bb){
 
@@ -1465,42 +1544,147 @@ struct CAT : public ModulePass {
         BasicBlock * first_bb = &F.getBasicBlockList().front();
         sBB_IN[first_bb].insert(arg_set.begin(), arg_set.end());
         
-        
+
 
         /**
          * calculate IN/OUT for each basic block
          * TODO: optimize with worklist!!
          * */
-        bool changed;
-        do{
-            changed = false;
-            for(BasicBlock &bb : F){
-                for(BasicBlock *Pred : predecessors(&bb)){
-                    std::set<Value*> temp3;
-                    set_union(sBB_IN[&bb],sBB_OUT[Pred],temp3);
-                    sBB_IN[&bb]=temp3;
-                }
-                std::set<Value*> out;
-                std::set<Value*> temp;
-                //  TEMP = (IN[i]-KILL[i])
-                set_diff(sBB_IN[&bb],sBB_KILL[&bb],temp);
-                //  OUT = GEN[i] U TEMP
-                set_union(sBB_GEN[&bb],temp,out);
+        std::set<Value*> oldOUT;
+        std::vector<BasicBlock*> tWorkList;
+        while(!workList.empty()){
+            BasicBlock *B = *workList.begin();
+            workList.erase(B);
 
-                if(!changed){
-                    changed = (out!=sBB_OUT[&bb]);
-                }
-                sBB_OUT[&bb] = out;
+            oldOUT = sBB_OUT[B];
+            /**
+             * IN[B] = U <p pred of B> OUT[p]
+             */
+            for(BasicBlock *Pred : predecessors(B)){
+                std::set<Value*> temp3;
+                set_union(sBB_IN[B],sBB_OUT[Pred],temp3);
+                sBB_IN[B]=temp3;
             }
-        }while(changed);
+            std::set<Value*> out;
+            std::set<Value*> temp;
+            //  TEMP = (IN[i]-KILL[i])
+            set_diff(sBB_IN[B],sBB_KILL[B],temp);
+            //  OUT = GEN[i] U TEMP
+            set_union(sBB_GEN[B],temp,out);
+            sBB_OUT[B] = out;
+            if(oldOUT!=sBB_OUT[B]){
+                std::set<BasicBlock*> sucSet;
+                for(BasicBlock *Suc : successors(B)){
+                    sucSet.insert(Suc);
+                }
+                set_union(workList,sucSet,workList);
+            }
+
+        }
+//        bool changed;
+//        do{
+//            changed = false;
+//            for(BasicBlock &bb : F){
+//                for(BasicBlock *Pred : predecessors(&bb)){
+//                    std::set<Value*> temp3;
+//                    set_union(sBB_IN[&bb],sBB_OUT[Pred],temp3);
+//                    sBB_IN[&bb]=temp3;
+//                }
+//                std::set<Value*> out;
+//                std::set<Value*> temp;
+//                //  TEMP = (IN[i]-KILL[i])
+//                set_diff(sBB_IN[&bb],sBB_KILL[&bb],temp);
+//                //  OUT = GEN[i] U TEMP
+//                set_union(sBB_GEN[&bb],temp,out);
+//
+//                if(!changed){
+//                    changed = (out!=sBB_OUT[&bb]);
+//                }
+//                sBB_OUT[&bb] = out;
+//            }
+//        }while(changed);
 
     }
 
+    void sIN_sOUT_backup(Function &F){
+
+            /**
+             * calculate GEN/KILL for each basic block
+             * */
+            for(auto &bb :F){
+                sBB_IN[&bb] = std::set<Value*>();
+                sBB_OUT[&bb] = std::set<Value*>();
+                sBB_GEN[&bb] = std::set<Value*>();
+                sBB_KILL[&bb] = std::set<Value*>();
+
+                for(llvm::Instruction &inst :bb){
+
+                    if (IN_MAP(userCall2replace, &inst)){
+                        calc_BB_GEN_KILL(&inst, &bb);
+                        for (auto & kv : userCall2replace[&inst]) {
+                            Instruction * dummy_instr = kv.second;
+                            calc_BB_GEN_KILL(dummy_instr, &bb);
+                        }
+                    } else {
+                        calc_BB_GEN_KILL(&inst, &bb);
+                    }
+                }
+
+                // errs() << "Basic block GEN : " << bb << '\n';
+                // print_set_with_addr(sBB_GEN[&bb]);
+                // errs() << "Basic block KILL : " << bb << '\n';
+                // print_set_with_addr(sBB_KILL[&bb]);
+            }
+
+            /**
+             * add arguments defs to IN of first BB
+             * */
+            BasicBlock * first_bb = &F.getBasicBlockList().front();
+            sBB_IN[first_bb].insert(arg_set.begin(), arg_set.end());
+
+
+
+            /**
+             * calculate IN/OUT for each basic block
+             * TODO: optimize with worklist!!
+             * */
+            bool changed;
+            do{
+                changed = false;
+                for(BasicBlock &bb : F){
+                    for(BasicBlock *Pred : predecessors(&bb)){
+                        std::set<Value*> temp3;
+                        set_union(sBB_IN[&bb],sBB_OUT[Pred],temp3);
+                        sBB_IN[&bb]=temp3;
+                    }
+                    std::set<Value*> out;
+                    std::set<Value*> temp;
+                    //  TEMP = (IN[i]-KILL[i])
+                    set_diff(sBB_IN[&bb],sBB_KILL[&bb],temp);
+                    //  OUT = GEN[i] U TEMP
+                    set_union(sBB_GEN[&bb],temp,out);
+
+                    if(!changed){
+                        changed = (out!=sBB_OUT[&bb]);
+                    }
+                    sBB_OUT[&bb] = out;
+                }
+            }while(changed);
+
+        }
+
     void __INSTR_INOUT(std::set<Value*> & prev_out, Instruction * inst) {
+
         std::set<Value*> local_INSTR_IN = prev_out;
 
         //TODO: need to be replaced by bitwise_diff function later
         std::set<Value*> local_INSTR_OUT = local_INSTR_IN;
+        if(!IN_SET(sGEN,inst)&&sKILL[inst].empty()){
+            sIN[inst] = local_INSTR_IN;
+            sOUT[inst] = local_INSTR_OUT;
+            prev_out = local_INSTR_OUT;
+            return;
+        }
 
         /**
          * IN[i] - KILL[i]
@@ -1526,6 +1710,8 @@ struct CAT : public ModulePass {
             std::set<Value*> prev_out = sBB_IN[&bb];
             // errs() << "Basic block IN : " << bb << '\n';
             // print_set_with_addr(prev_out);
+            if(sBB_GEN[&bb].empty()&&sBB_KILL[&bb].empty())
+                continue;
             for(Instruction &inst : bb){
 
                 if (IN_MAP(userCall2replace, &inst)){
@@ -1559,14 +1745,25 @@ struct CAT : public ModulePass {
         }   
     }
     void reachingDef_wrap(Function &F, AliasAnalysis & AA) {
-        errs() << "Reaching definition on " << F.getName() << '\n';
+        //errs() << "Reaching definition on " << F.getName() << '\n';
+        Timer timer;
+            timer.start();
         sGEN_sKILL_init();
         sGEN_sKILL(F, AA);
+            timer.stop();
+            timer.printDuration("\t\tREACHING DEF GEN-KILL ");
         //print_gen_kill(caller_name,F);
+            timer.start();
         sIN_sOUT(F);
+            timer.stop();
+            timer.printDuration("\t\tREACHING DEF IN-OUT BB ");
+
+            timer.start();
         sIN_OUT_inst(F);
+            timer.stop();
+            timer.printDuration("\t\tREACHING DEF IN-OUT INST ");
         // print_in_out(F);
-        errs() << "Done: Reaching definition on " << F.getName() << '\n';
+        //errs() << "Done: Reaching definition on " << F.getName() << '\n';
     }
     
 
@@ -2050,7 +2247,7 @@ struct CAT : public ModulePass {
                 phi->getIncomingBlock(i)
             );
         }
-        errs() << "Creating const phi " << *const_phi << " before " << *phi << '\n';
+        //errs() << "Creating const phi " << *const_phi << " before " << *phi << '\n';
         return const_phi;
     }
 
@@ -2071,7 +2268,7 @@ struct CAT : public ModulePass {
                 BBs[i]
             );
         }
-        errs() << "Creating artificial_phi " << *artificial_phi  << " at " << artificial_phi << '\n';
+        //errs() << "Creating artificial_phi " << *artificial_phi  << " at " << artificial_phi << '\n';
         return artificial_phi;
     }
 
@@ -2234,8 +2431,8 @@ struct CAT : public ModulePass {
             Value * ptr = loadInst->getPointerOperand();
 
             if (Value * val  = must_point2(instr, ptr)) {
-                errs() << "At instruction : " << *instr; 
-                errs() << " the load result must be " << *val << '\n';
+                //errs() << "At instruction : " << *instr;
+                //errs() << " the load result must be " << *val << '\n';
                 if(check_constant_s(instr, val, &temp_val)) {
                     *res = temp_val;
                     return true;
@@ -2395,7 +2592,7 @@ struct CAT : public ModulePass {
     void delete_phi_constant(Instruction * inst) {
         for (auto & old_news : phi_toInsert[inst]) {
             for (PHINode * newPhi : old_news.second) {
-                errs() << "deleting constant phi" << *newPhi << " at " << newPhi << '\n';
+                //errs() << "deleting constant phi" << *newPhi << " at " << newPhi << '\n';
                 delete newPhi;
             }
         }
@@ -2420,7 +2617,7 @@ struct CAT : public ModulePass {
 
     void delete_phi_artificial(Instruction * inst) {
         for (auto & art_phi : arti_phi_toInsert[inst]) {
-            errs() << "deleting artificial phi " << *art_phi << " at " << art_phi << '\n';
+            //errs() << "deleting artificial phi " << *art_phi << " at " << art_phi << '\n';
             delete art_phi;
         }
         arti_phi_toInsert.erase(inst);
@@ -2465,8 +2662,8 @@ struct CAT : public ModulePass {
             Value * ptr = loadInst->getPointerOperand();
 
             if (Value * val  = must_point2(instr, ptr)) {
-                errs() << "At instruction : " << *instr; 
-                errs() << " the load result must be " << *val << '\n';
+                //errs() << "At instruction : " << *instr;
+                //errs() << " the load result must be " << *val << '\n';
                 if(VAL_check_constant_s(instr, val, NULL, &temp_val)) {
                     *res = temp_val;
                     return true;
@@ -2727,7 +2924,7 @@ struct CAT : public ModulePass {
 
 
     bool constant_folding(Function & F, AliasAnalysis & AA) {
-        errs() << "Folding on " << F.getName().str() << '\n';
+        //errs() << "Folding on " << F.getName().str() << '\n';
         std::unordered_map<llvm::CallInst *, Value *> toFold;
 
         /**
@@ -2852,7 +3049,7 @@ struct CAT : public ModulePass {
                 substitution = build_add_sub(kv.first, arg1_val, arg2_val);
             }
 
-            errs() << "Folding " << *kv.first << " by CATset " << *substitution << " at " << substitution << '\n';
+            //errs() << "Folding " << *kv.first << " by CATset " << *substitution << " at " << substitution << '\n';
             toFold[callinst] = build_cat_set(callinst, substitution);
         }
 
@@ -2864,7 +3061,7 @@ struct CAT : public ModulePass {
     }
 
     bool constant_propagation(Function & F, AliasAnalysis & AA) {
-        errs() << "Propogate on " << F.getName().str() << '\n';
+        //errs() << "Propogate on " << F.getName().str() << '\n';
         phi_toInsert.clear();
         arti_phi_toInsert.clear();
 
@@ -2889,7 +3086,7 @@ struct CAT : public ModulePass {
                             // toPropogate[call_instr] = build_constint(arg_val);
                             toPropogate[call_instr] = arg_LLVM_val;
 
-                            errs() << "Propogate " << *call_instr << " with " << *arg_LLVM_val << '\n';
+                            //errs() << "Propogate " << *call_instr << " with " << *arg_LLVM_val << '\n';
                         } else {
                             // phi_toInsert.erase(call_instr);
                             delete_phi_constant(call_instr);
