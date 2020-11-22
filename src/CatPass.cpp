@@ -93,6 +93,7 @@ struct CAT : public ModulePass {
 
     std::unordered_map<Value*, std::set<Value*>> sVar2mightDef;
     // maps gen instruction to variable it defines
+    std::unordered_map<Value* ,std::vector<Value*>> BB2CAT;
     
     std::unordered_map<Value *, Value*> ptrToVal;
 
@@ -861,6 +862,7 @@ struct CAT : public ModulePass {
         sOUT.clear();
 
         arg_set.clear();
+        BB2CAT.clear();
     }
 
     void mpt_init() {
@@ -1353,9 +1355,10 @@ struct CAT : public ModulePass {
         /**
          *  Handling GEN KILL for Function argument
          * */
-        
+        BasicBlock *entry = &F.getEntryBlock();
         for (Argument &arg:  F.args()){
             if (isa<PointerType>(arg.getType())) {
+                BB2CAT[entry].push_back(&arg);
        
                 arg_set.insert(&arg);
 
@@ -1367,114 +1370,126 @@ struct CAT : public ModulePass {
             } 
         }
 
+        for(auto& BB:F){
 
-        for (auto& inst: llvm::instructions(F)) {
-            if (isa<CallInst>(&inst)){
-                CallInst * call_instr = cast<CallInst>(&inst);
-                Function * callee_ptr = call_instr->getCalledFunction();
+            for(auto &inst:BB){
+                if (isa<CallInst>(&inst)){
+                    CallInst * call_instr = cast<CallInst>(&inst);
+                    Function * callee_ptr = call_instr->getCalledFunction();
 
-                if (IS_CAT_OP(callee_ptr)) {
-                
-                    if (!IS_CAT_get(callee_ptr)) {
+                    if (IS_CAT_OP(callee_ptr)) {
+                        BB2CAT[&BB].push_back(&inst);
 
-                        Value * key;
-                        if (IS_CAT_new(callee_ptr)) {
-                            key = call_instr;
+                        if (!IS_CAT_get(callee_ptr)) {
 
-                        } else {
-                            // get first operand if CAT_set, CAT_add, CAT_sub
-                            std::vector<Value *>  might_defines;
-                            key =  get_define_target(call_instr, AA, might_defines);
-                            
-                            polulate_sVar2mightDef(might_defines, &inst);
-                        }
-                        
-                        GEN_record_info(
+                            Value * key;
+                            if (IS_CAT_new(callee_ptr)) {
+                                key = call_instr;
+
+                            } else {
+                                // get first operand if CAT_set, CAT_add, CAT_sub
+                                std::vector<Value *>  might_defines;
+                                key =  get_define_target(call_instr, AA, might_defines);
+
+                                polulate_sVar2mightDef(might_defines, &inst);
+                            }
+
+                            GEN_record_info(
                                     call_instr,    /* gen value */
                                     key,    /* Variable that gen defines*/
                                     sGEN2var /* local info recorder*/
-                        );
-                    }
+                            );
+                        }
 
-                } else if (IS_USER_FUNC(callee_ptr)){
-                    // TODO: user function defines all arg
-                    // we technically only cares about CAT obj, so we only care ptr argument
-                    uint32_t num_arg = call_instr->getNumArgOperands();
-                    for (uint32_t i = 0; i < num_arg; i++) {
-                        Value * arg = call_instr->getArgOperand(i);
+                    } else if (IS_USER_FUNC(callee_ptr)){
+                        // TODO: user function defines all arg
+                        // we technically only cares about CAT obj, so we only care ptr argument
+                        uint32_t num_arg = call_instr->getNumArgOperands();
+                        for (uint32_t i = 0; i < num_arg; i++) {
+                            Value * arg = call_instr->getArgOperand(i);
 
-                        /**
-                         * Possible solution:
-                         *  for each ptr argument of user function f we generate a dummy instruction
-                         *          we assume that instruction defines arg and alias of arg
-                         *  The relation is recorded in the map callInst -> set of dummy instructions
-                         *  
-                         * */
-                        if (isa<PointerType>(arg->getType())) {
-                            std::vector<Value *> possible_vals;
+                            /**
+                             * Possible solution:
+                             *  for each ptr argument of user function f we generate a dummy instruction
+                             *          we assume that instruction defines arg and alias of arg
+                             *  The relation is recorded in the map callInst -> set of dummy instructions
+                             *
+                             * */
+                            if (isa<PointerType>(arg->getType())) {
+                                std::vector<Value *> possible_vals;
 
-                            if (IS_CAT_VAR(arg)) {
-                                possible_vals.push_back(arg);
-                            } else {
-                                /**
-                                 *  Has the possibility of being a pointer to CAT_VAR
-                                 * */
-                                may_point2(&inst, arg, possible_vals);
-                            }
+                                if (IS_CAT_VAR(arg)) {
+                                    possible_vals.push_back(arg);
+                                } else {
+                                    /**
+                                     *  Has the possibility of being a pointer to CAT_VAR
+                                     * */
+                                    may_point2(&inst, arg, possible_vals);
+                                }
 
-                            for (uint32_t j = 0; j < possible_vals.size(); j++) {
-                                
-                                MemoryLocation memLoc(possible_vals[j]);
-                                ModRefInfo info = AA.getModRefInfo(call_instr, memLoc); 
+                                for (uint32_t j = 0; j < possible_vals.size(); j++) {
+
+                                    MemoryLocation memLoc(possible_vals[j]);
+                                    ModRefInfo info = AA.getModRefInfo(call_instr, memLoc);
 
 
-                                // errs() << *call_instr << " has arg " << *arg << " at " << arg;
-                                // errs() << "arg points to " << *possible_vals[j] <<  " with ModRefInfo = " << ModRefInfo_toString(info) <<'\n';
-                                if (HAS_MOD(info)){
-                                    
-                                    Value * dummy = dummy_def_val(possible_vals[j], call_instr);
-                                    
-                                    GEN_record_info(
+                                    // errs() << *call_instr << " has arg " << *arg << " at " << arg;
+                                    // errs() << "arg points to " << *possible_vals[j] <<  " with ModRefInfo = " << ModRefInfo_toString(info) <<'\n';
+                                    if (HAS_MOD(info)){
+
+                                        Value * dummy = dummy_def_val(possible_vals[j], call_instr);
+
+                                        BB2CAT[&BB].push_back(dummy);
+                                        GEN_record_info(
                                                 dummy,               /* gen value, used dummy instruction as the gen*/
                                                 possible_vals[j],    /* Variable that gen defines*/
                                                 sGEN2var             /* local info recorder*/
-                                    );
+                                        );
+                                    }
                                 }
                             }
-                        }                
-                    }
-                    
-                    /**
-                     * If call instruction itself returns a pointer
-                     * */
-                    if (isa<PointerType>(call_instr->getType())) {
+                        }
 
-                        GEN_record_info(
+                        /**
+                         * If call instruction itself returns a pointer
+                         * */
+                        if (isa<PointerType>(call_instr->getType())) {
+                            BB2CAT[&BB].push_back(call_instr);
+                            GEN_record_info(
                                     call_instr,          /* pointer returns by funciont */
                                     call_instr,         /* defines itself*/
                                     sGEN2var             /* local info recorder*/
-                        );
+                            );
+                        }
                     }
-                }
 
-            } else if (isa<PHINode>(&inst)) {
-                PHINode * phi = cast<PHINode> (&inst);
+                } else if (isa<PHINode>(&inst)) {
+                    PHINode * phi = cast<PHINode> (&inst);
 
-                /**
-                 * only phi node with Pointer type we should care, right?
-                 * */
-                if (isa<PointerType> (phi->getType())){
-                    GEN_record_info(
+                    /**
+                     * only phi node with Pointer type we should care, right?
+                     * */
+                    if (isa<PointerType> (phi->getType())){
+                        BB2CAT[&BB].push_back(phi);
+                        GEN_record_info(
                                 phi,          /* phi pointer */
                                 phi,         /* defines itself*/
                                 sGEN2var     /* local info recorder*/
-                    );
+                        );
+
+                    }
 
                 }
-                
-            } 
-
+                // INST Loop
+            }
+            //BB Loop
         }
+
+
+//        for (auto& inst: llvm::instructions(F)) {
+//
+//
+//        }
 
         /**
          *  Generating KILL per instruction
@@ -1710,30 +1725,33 @@ struct CAT : public ModulePass {
             std::set<Value*> prev_out = sBB_IN[&bb];
             // errs() << "Basic block IN : " << bb << '\n';
             // print_set_with_addr(prev_out);
-            if(sBB_GEN[&bb].empty()&&sBB_KILL[&bb].empty())
-                continue;
-            for(Instruction &inst : bb){
+//            if(sBB_GEN[&bb].empty()&&sBB_KILL[&bb].empty())
+//                continue;
+            for(auto &I : BB2CAT[&bb]){
+                if(isa<Instruction>(I)){
+                    Instruction *inst = cast<Instruction>(I);
+                    if (IN_MAP(userCall2replace, inst)){
+                        /**
+                         * This is a instruction that calls others
+                         * IN[i] should just be the previous IN
+                         * OUT[i] should be the last OUT produced by arguments replacement
+                         */
+                        __INSTR_INOUT(prev_out, inst);
+                        sIN[inst] = prev_out;
+                        for (auto & kv : userCall2replace[inst]) {
+                            Instruction * dummy_instr = kv.second;
+                            __INSTR_INOUT(prev_out, dummy_instr);
+                            sOUT[inst] = prev_out;
+                        }
 
-                if (IN_MAP(userCall2replace, &inst)){
-                    /**
-                     * This is a instruction that calls others
-                     * IN[i] should just be the previous IN
-                     * OUT[i] should be the last OUT produced by arguments replacement 
-                     */
-                    __INSTR_INOUT(prev_out, &inst);
-                    sIN[&inst] = prev_out;
-                    for (auto & kv : userCall2replace[&inst]) {
-                        Instruction * dummy_instr = kv.second;
-                        __INSTR_INOUT(prev_out, dummy_instr);
-                        sOUT[&inst] = prev_out;
+                    } else {
+                        /**
+                         * This is a normal instruction should be good with what we have done before
+                         */
+                        __INSTR_INOUT(prev_out, inst);
                     }
-
-                } else {
-                    /**
-                     * This is a normal instruction should be good with what we have done before
-                     */
-                   __INSTR_INOUT(prev_out, &inst);
                 }
+
                 
             }
         }
