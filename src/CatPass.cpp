@@ -117,12 +117,21 @@ struct CAT : public FunctionPass {
     enum CycleResult {noCycle, mustCycle, mightCycle};
     std::unordered_map<Value *, CycleResult> func2cycle;
 
+    std::map<Value * , Value *> auto2def;
+
 #define IS_PTR_TYPE(val) (isa<PointerType>(val->getType()) )
 #define IS_INT_TYPE(val) (isa<IntegerType>(val->getType()) )
 #define HAS_MOD(info) (\
         info == ModRefInfo::MustMod \
     || info == ModRefInfo::MustModRef \
     || info == ModRefInfo::Mod \
+    || info == ModRefInfo::ModRef \
+)
+
+#define HAS_REF(info) (\
+        info == ModRefInfo::MustRef \
+    || info == ModRefInfo::MustModRef \
+    || info == ModRefInfo::Ref \
     || info == ModRefInfo::ModRef \
 )
 
@@ -341,13 +350,18 @@ struct CAT : public FunctionPass {
         AliasAnalysis & AA = getAnalysis<AAResultsWrapperPass>().getAAResults();
         mpt_wrap(F, AA);
         reachingDef_wrap(F, AA);
-        constant_folding(F, AA);
+        bool folded = constant_folding(F, AA);
 
         mpt_wrap(F, AA);
         reachingDef_wrap(F, AA);
-        constant_propagation(F, AA);
+        bool propogated = constant_propagation(F, AA);
         
-        live_analysis_wrapper(F, AA);
+        if (! (folded || propogated)) {
+            mpt_wrap(F, AA);
+            live_analysis_wrapper(F, AA);
+            eliminating(F, AA);
+        }
+        
         return false;
     }
 
@@ -533,21 +547,73 @@ struct CAT : public FunctionPass {
         ptr2Val.clear();
     }
     
+    Value * auto_trace_back(Value * val) {
+        if (IN_MAP(auto2def, val)){
+            return auto2def[val];
+        }
 
-    void select_trace_back(Value * val, std::vector<Value *> & res) {
+        if (!isa<IntToPtrInst>(val)) {
+            return val;
+        }
+        
+        IntToPtrInst * int2ptr = cast<IntToPtrInst>(val);
+        Value * int2ptr_op0 = int2ptr->getOperand(0);    
+        
+        if(!isa<AShrOperator>(int2ptr_op0)){
+            return val;
+        }
+        
+        AShrOperator * ashr = cast<AShrOperator>(int2ptr_op0);
+        Value * ashr_op0 = ashr->getOperand(0);
+        
+        if(!isa<ShlOperator>(ashr_op0)){
+            return val;
+        }
+
+        ShlOperator * shl = cast<ShlOperator>(ashr_op0);
+        Value * shl_op0 = shl->getOperand(0);
+        
+        if(!isa<PtrToIntInst>(shl_op0)){
+            return val;
+        }
+
+        PtrToIntInst * ptr2int = cast<PtrToIntInst>(shl_op0);
+        Value * ptr2int_op0 = ptr2int->getOperand(0);
+
+        errs() << *val << " can be traced back as auto of " << *ptr2int_op0 << '\n';
+        auto2def[val] = ptr2int_op0;
+        return ptr2int_op0;
+    }
+
+    void select_phi_trace_back(Value * val, std::vector<Value *> & res) {
         res.push_back(val);
-        if (!isa<SelectInst>(val)) return;
+        if (!isa<SelectInst>(val) && !isa<PHINode>(val)) return;
 
-        SelectInst * select = cast<SelectInst>(val);
+        if (isa<SelectInst>(val)){
+            SelectInst * select = cast<SelectInst>(val);
 
-        Value * op1 = select->getOperand(1);
-        Value * op2 = select->getOperand(2);
+            Value * op1 = select->getOperand(1);
+            Value * op2 = select->getOperand(2);
 
-        res.push_back(op1);
-        res.push_back(op2);
+            res.push_back(op1);
+            res.push_back(op2);
 
-        select_trace_back(op1, res);
-        select_trace_back(op2, res);
+            select_phi_trace_back(op1, res);
+            select_phi_trace_back(op2, res);
+        }
+        
+        if (isa<PHINode>(val)){
+            PHINode * phi = cast<PHINode>(val);
+
+            uint32_t numIncome = phi->getNumIncomingValues();
+            for (uint32_t i = 0; i < numIncome; i++) {
+                Value * arg = phi->getIncomingValue(i);
+                res.push_back(arg);
+            
+                select_phi_trace_back(arg, res);
+                select_phi_trace_back(arg, res);
+            }
+        }
     }
 
 
@@ -577,8 +643,8 @@ struct CAT : public FunctionPass {
                     std::vector<Value *> ptr_collect;
                     std::vector<Value *> value_collect;
 
-                    select_trace_back(ptrOperand, ptr_collect);
-                    select_trace_back(valueStored, value_collect);
+                    select_phi_trace_back(ptrOperand, ptr_collect);
+                    select_phi_trace_back(valueStored, value_collect);
                     
                     for (Value * ptr : ptr_collect) {
                         for (Value * val : value_collect) {
@@ -609,7 +675,7 @@ struct CAT : public FunctionPass {
                                  *      This has the suspicion of being a pointer to CAT variable
                                  * */
                                 ModRefInfo ModRefResult = AA.getArgModRefInfo(call_instr, i);
-                                errs() << " MPT user function: " << inst << " , arg = " << *arg << " ModRefResult = " << ModRefInfo_toString(ModRefResult) << '\n';
+                                // errs() << " MPT user function: " << inst << " , arg = " << *arg << " ModRefResult = " << ModRefInfo_toString(ModRefResult) << '\n';
                                 if (HAS_MOD(ModRefResult)) {
                                     /**
                                      *  If the pointer is modified
@@ -2643,8 +2709,15 @@ struct CAT : public FunctionPass {
         }
     }
 
+    /**
+     *  live_{GEN|KILL|IN|OUT} are for the liveness of values of variables
+     *  ref_{GEN|KILL|IN|OUT} are for the liveness of References of variables
+     * */
+
     std::map<Value *, std::set<Value *>> live_GEN, live_KILL;
     std::map<Value *, std::set<Value *>> live_IN, live_OUT;
+    std::map<Value *, std::set<Value *>> ref_GEN, ref_KILL;
+    std::map<Value *, std::set<Value *>> ref_IN, ref_OUT;
 
     void live_analysis_init() {
         // std::map<Value *, std::set<Value *>> live_GEN, live_KILL;
@@ -2654,6 +2727,49 @@ struct CAT : public FunctionPass {
         live_KILL.clear();
         live_IN.clear();
         live_OUT.clear();
+    }
+
+
+    void might_alias(Instruction * inst, Value * target, std::vector<Value *> & aliases) {
+        if (isa<PHINode>(target) || isa<SelectInst>(target)) {
+            select_phi_trace_back(target, aliases);
+            return;
+        }
+
+        if (isa<LoadInst>(target)) {
+            LoadInst * load_inst = cast<LoadInst>(target);
+            Value * ptr = load_inst->getPointerOperand();
+            
+            may_point2(inst, ptr, aliases);
+            aliases.push_back(load_inst);
+
+            return;
+        }
+
+        /**
+         *  Other cases: CAT_new, Argument 
+         * */
+        aliases.push_back(target);
+    }
+
+    void live_GEN_populate(Instruction * inst, Value * used_var) {
+        std::vector<Value *> aliases;
+        might_alias(inst, used_var, aliases);
+        live_GEN[inst].insert(aliases.begin(), aliases.end());
+    }
+
+    void live_KILL_populate(Instruction * inst, Value * def_var) {
+        live_KILL[inst].insert(def_var);
+        
+        if (isa<LoadInst>(def_var)) {
+            LoadInst * load_inst = cast<LoadInst>(def_var);
+            Value * ptr = load_inst->getPointerOperand();
+
+            Value * must_val = must_point2(inst, ptr);
+            if (must_val) {
+                live_KILL[inst].insert(must_val);
+            }
+        }
     }
 
     void live_analysis_GENKILL(Function & F, AliasAnalysis & AA ){
@@ -2670,22 +2786,26 @@ struct CAT : public FunctionPass {
                             // only define but not killed
                             live_KILL[&inst].insert(&inst);
                             
+                            ref_KILL[&inst].insert(&inst);
                         } else if (IS_CAT_get(fptr)) {
-                            // only use variable, CAT_get
+                            /**
+                             *  Only use variable, both value and reference
+                             * */
                             Value * arg0 = call_instr->getArgOperand(0);
-                            live_GEN[&inst].insert(arg0);
+                            
+                            live_GEN_populate(call_instr, arg0);
 
-
-                            // also define itself for printf usage
-                            // live_KILL_INST[&inst].insert(&inst);
+                            ref_GEN[&inst].insert(arg0);
+                            
                         } else if (IS_CAT_set(fptr)) {
                             // CAT_set, define and usearg0
                             
                             // Instruction * arg0 = cast<Instruction>(call_instr->getArgOperand(0));
                             Value * arg0 = call_instr->getArgOperand(0);
 
-                            live_KILL[&inst].insert(arg0);
+                            live_KILL_populate(call_instr, arg0);
 
+                            ref_GEN[&inst].insert(arg0);
                         } else {
                             // CAT_add, CAT_sub
                             // define arg0
@@ -2695,37 +2815,162 @@ struct CAT : public FunctionPass {
                             Value * arg1 = call_instr->getArgOperand(1);
                             Value * arg2 = call_instr->getArgOperand(2);
 
-                            live_KILL[&inst].insert(arg0);
-                            live_GEN[&inst].insert(arg1);
-                            live_GEN[&inst].insert(arg2);
+                            live_KILL_populate(call_instr, arg0);
+
+                            live_GEN_populate(call_instr, arg1);
+
+                            live_GEN_populate(call_instr, arg2);
+
+                            ref_GEN[&inst].insert(arg0);
+                            ref_GEN[&inst].insert(arg1);
+                            ref_GEN[&inst].insert(arg2);
                         }   
 
                     } else if (IS_USER_FUNC(fptr)){
-                        // Other function? 
                         uint32_t arg_cnt = call_instr->getNumArgOperands();
                         for(uint32_t i = 0; i < arg_cnt; i++){
                             Value * arg = call_instr->getArgOperand(i);
-                            // if (isa<Instruction>(arg)){
-                            //     // Possibly use and define at the same time
-                            //     Instruction * arg_inst = cast<Instruction>(arg);
+                            
+                            
+                            /**
+                             * TODO: augmented with alias analysis and MPT analysis
+                             * */
 
-                            //     live_KILL_INST[&inst].insert(arg_inst);
-                            //     live_GEN_INST[&inst].insert(arg_inst);
-                            // } else {
-                            //     // argument? 
-                            //     // constant??
-                            // }
+                            if (IS_PTR_TYPE(arg)) {
+                                
+                                // std::vector<Value *> possible_vals;
+                                // may_point2(&inst, arg, possible_vals);
+                                // if (possible_vals.empty()) possible_vals.push_back(arg);
+                                
+                                // for (Value * val : possible_vals){
+                                //     MemoryLocation memLoc(val);
+                                //     ModRefInfo info = AA.getModRefInfo(call_instr, memLoc); 
+
+
+                                // // errs() << *call_instr << " has arg " << *arg << " at " << arg;
+                                // // errs() << "arg points to " << *possible_vals[j] <<  " with ModRefInfo = " << ModRefInfo_toString(info) <<'\n';
+                                //     if (HAS_MOD(info)){
+                                        
+                                //     }
+
+                                //     if (HAS_REF(info)){
+                                        
+                                //     }                                   
+                                
+                                //     live_KILL[&inst].insert(arg);
+                                //     live_GEN[&inst].insert(arg);
+                                //     ref_GEN[&inst].insert(arg);
+                                // }
+                                live_KILL[&inst].insert(arg);
+                                live_GEN[&inst].insert(arg);
+                                ref_GEN[&inst].insert(arg);
+                            }
                         
-                            live_KILL[&inst].insert(arg);
-                            live_GEN[&inst].insert(arg);
-
                         }
                     } else {
                         /**
                          *  Non user function, should not matter at current stage
                          * */
-                    
+                        
                     }
+
+                } else if (isa<PHINode>(&inst)){
+                    PHINode * phi = cast<PHINode>(&inst);
+                    if (IS_PTR_TYPE(phi)) {
+                        live_KILL[phi].insert(phi);
+                        ref_KILL[phi].insert(phi);
+
+                        uint32_t numIncome =  phi->getNumIncomingValues();
+
+                        for (uint32_t i = 0; i < numIncome; i++) {
+                            Value * in_value = phi->getIncomingValue(i);
+                            live_GEN[phi].insert(in_value);
+                            ref_GEN[phi].insert(in_value);
+                        }
+                    }
+
+                } else if (isa<SelectInst>(&inst)){
+                    SelectInst * select_inst = cast<SelectInst>(&inst);
+                    if (IS_PTR_TYPE(select_inst)) {
+                        live_KILL[select_inst].insert(select_inst);
+                        ref_KILL[select_inst].insert(select_inst);
+
+                        Value * op1 = select_inst->getOperand(1);
+                        Value * op2 = select_inst->getOperand(2);
+                        
+                        live_GEN[select_inst].insert(op1);
+                        ref_GEN[select_inst].insert(op1);
+
+                        live_GEN[select_inst].insert(op2);
+                        ref_GEN[select_inst].insert(op2);
+                    }   
+
+                } else if (isa<StoreInst>(&inst)) {
+                    
+                    StoreInst * store_inst = cast<StoreInst>(&inst);
+                    Value * ptr = store_inst->getPointerOperand();
+                    Value * val = store_inst->getValueOperand();
+                    
+                    live_KILL[store_inst].insert(ptr);
+                    ref_GEN[store_inst].insert(val);
+                    live_GEN[store_inst].insert(val);
+
+                } else if (isa<LoadInst>(&inst)) {
+                    LoadInst * load_inst = cast<LoadInst>(&inst);
+                    Value * ptr = load_inst->getPointerOperand();
+                    
+                    live_GEN[load_inst].insert(ptr);
+                    ref_KILL[load_inst].insert(load_inst);
+                    live_KILL[load_inst].insert(load_inst);
+                
+                } else if (isa<AllocaInst>(&inst)) {
+                    AllocaInst * alloc_inst = cast<AllocaInst>(&inst);
+                    
+                    ref_KILL[alloc_inst].insert(alloc_inst);
+
+                } else if (isa<ReturnInst>(&inst)) {
+
+                    
+                    ReturnInst * return_inst = cast<ReturnInst>(&inst);
+                    Value * ret_val = return_inst->getReturnValue();
+
+                    if (ret_val && IS_PTR_TYPE(ret_val)){
+                        ref_GEN[return_inst].insert(ret_val);
+                        live_GEN[return_inst].insert(ret_val);
+                    }
+
+                } else if (isa<PtrToIntInst>(&inst)) {
+                    PtrToIntInst * ptr2int = cast<PtrToIntInst>(&inst);
+                    Value * ptr2int_op0 = ptr2int->getOperand(0);
+
+                    ref_GEN[ptr2int].insert(ptr2int_op0);
+                    ref_KILL[ptr2int].insert(ptr2int);
+                    live_KILL[ptr2int].insert(ptr2int);
+
+                } else if (isa<ShlOperator>(&inst)) {
+                    ShlOperator * shl = cast<ShlOperator>(&inst);
+                    Value * shl_op0 = shl->getOperand(0);
+
+                    ref_GEN[shl].insert(shl_op0);
+                    ref_KILL[shl].insert(shl);
+                    live_KILL[shl].insert(shl);
+
+                } else if (isa<AShrOperator>(&inst)) {
+                    AShrOperator * ashr = cast<AShrOperator>(&inst);
+                    Value * ashr_op0 = ashr->getOperand(0);
+
+                    ref_GEN[ashr].insert(ashr_op0);
+                    ref_KILL[ashr].insert(ashr);
+                    live_KILL[ashr].insert(ashr);
+
+                } else if (isa<IntToPtrInst>(&inst)) {
+                    IntToPtrInst * int2ptr = cast<IntToPtrInst>(&inst);
+                    Value * int2ptr_op0 = int2ptr->getOperand(0);
+
+                    ref_GEN[int2ptr].insert(int2ptr_op0);
+                    ref_KILL[int2ptr].insert(int2ptr);
+                    live_KILL[int2ptr].insert(int2ptr);
+
                 }
             }
         }
@@ -2735,7 +2980,13 @@ struct CAT : public FunctionPass {
         // print_set_reference(referenced_var);
     }
 
-    bool calc_live_OUT2IN(Instruction * inst) {
+    bool calc_live_OUT2IN(
+        Instruction * inst,
+        std::map<Value *, std::set<Value *>> & GEN,
+        std::map<Value *, std::set<Value *>> & KILL,
+        std::map<Value *, std::set<Value *>> & IN,
+        std::map<Value *, std::set<Value *>> & OUT
+    ) {
         std::set<Value *> tempIN;
          /**
              *  p = &x;
@@ -2743,23 +2994,29 @@ struct CAT : public FunctionPass {
              * */
         std::set<Value *> outMinusKill;
         set_diff(
-            live_OUT[inst],   /* srcA */
-            live_KILL[inst],  /* srcB */
+            OUT[inst],   /* srcA */
+            KILL[inst],  /* srcB */
             outMinusKill      /* target */
         );
 
         set_union(
             outMinusKill,   /* srcA */
-            live_GEN[inst], /* srcB */
+            GEN[inst], /* srcB */
             tempIN          /* target */
         );
 
-        bool diff = tempIN != live_IN[inst];
-        live_IN[inst] = tempIN;
+        bool diff = tempIN != IN[inst];
+        IN[inst] = tempIN;
         return diff;
     }
 
-    void live_analysis_INOUT(Function & F) {
+    void backward_INOUT(
+        Function & F,
+        std::map<Value *, std::set<Value *>> & GEN,
+        std::map<Value *, std::set<Value *>> & KILL,
+        std::map<Value *, std::set<Value *>> & IN,
+        std::map<Value *, std::set<Value *>> & OUT
+    ) {
         std::set<BasicBlock *> bb_calced;
 
         bool changed;
@@ -2774,27 +3031,27 @@ struct CAT : public FunctionPass {
                 for (BasicBlock * succBB : successors(&bb)) {
                     Instruction * predBB_terminator = &succBB->front();
 
-                    live_OUT[last_inst].insert(
-                        live_IN[predBB_terminator].begin(),
-                        live_IN[predBB_terminator].end()
+                    OUT[last_inst].insert(
+                        IN[predBB_terminator].begin(),
+                        IN[predBB_terminator].end()
                     );
                 }
 
-                bool last_in_changed = calc_live_OUT2IN(last_inst);
+                bool last_in_changed = calc_live_OUT2IN(last_inst, GEN, KILL, IN, OUT);
                 
                 if (!changed) changed = last_in_changed;
 
                 if (last_in_changed  || !IN_SET(bb_calced, &bb)) {
                     bool in_changed;
-                    std::set<Value *> nextIN = live_IN[last_inst];
+                    std::set<Value *> nextIN = IN[last_inst];
 
                     for (auto iter = (++bb.rbegin()); iter != bb.rend(); iter++) {
                         Instruction * cur_ptr = &*iter;
-                        live_OUT[cur_ptr] = nextIN;
+                        OUT[cur_ptr] = nextIN;
 
-                        in_changed = calc_live_OUT2IN(cur_ptr);
+                        in_changed = calc_live_OUT2IN(cur_ptr, GEN, KILL, IN, OUT);
 
-                        nextIN = live_IN[cur_ptr];
+                        nextIN = IN[cur_ptr];
                     }
 
                     if (!changed) changed = in_changed;
@@ -2806,9 +3063,93 @@ struct CAT : public FunctionPass {
         } while(changed);
     }
 
-    bool eliminating(Function &F, AliasAnalysis & AA) {
 
+    /**
+     *  Return if def which is defined by inst has contruction outside the function
+     **/
+    bool var_escaped(CallInst * inst, Value * def) {
+        
+        
+        if (isa<Argument>(def)) {
+            return true;
+        }
+
+        if (isa<GlobalVariable>(def)) {
+            return true;
+        }
+        
+        Function * parent_func = inst->getParent()->getParent();
+
+        if (isa<LoadInst>(def)) {
+            LoadInst * load_inst = cast<LoadInst>(def);
+            Value * ptr = load_inst->getPointerOperand();
+            
+            return var_escaped(inst, ptr);
+        }
         return false;
+    }
+
+    bool can_be_eliminated(CallInst * inst) {
+        
+        Function * fptr = inst->getCalledFunction();
+        if (fptr == nullptr) return false;
+        if (!IS_CAT_OP(fptr)) return false;
+
+        if (IS_CAT_new(fptr)) {
+            return !IN_SET(ref_OUT[inst], inst);           
+        }
+
+        bool escaped = var_escaped(inst, inst->getArgOperand(0));
+        if (escaped) return false;
+
+
+        /**
+         *  An instruction can be eliminated if what it defines will not be used by later instructions
+         *  live_OUT[inst] & live_KILL[inst] = empty
+         * */
+        std::set<Value *> laterUsed;
+        set_intersect(
+            live_OUT[inst],     /* srcA */
+            live_KILL[inst],    /* srcB */
+            laterUsed           /* target */
+        );
+
+        return laterUsed.empty();
+    }
+
+    void elimiating_erase(std::vector<Instruction *> & to_eliminate) {
+        for (Instruction * inst : to_eliminate) {
+            inst->eraseFromParent();
+        }
+    }
+
+    bool eliminating(Function &F, AliasAnalysis & AA) {
+        
+        std::vector<Instruction *> to_eliminate;
+
+        for (BasicBlock &bb : F){
+        for(Instruction &inst : bb){
+            if (isa<CallInst>(&inst)) {
+                CallInst * call_inst = cast<CallInst>(&inst);
+                Function * fptr = call_inst->getCalledFunction();
+                if (IS_CAT_OP(fptr)) {
+                    if (!IS_CAT_get(fptr)) {
+
+                        bool canElim = can_be_eliminated(call_inst);
+                        if (canElim){
+                            to_eliminate.push_back(call_inst);
+                            errs() << "Eliminating " << *call_inst << '\n';
+                        }
+                    }
+                }
+            }
+            
+        }
+        }
+
+        elimiating_erase(to_eliminate);
+
+        return !to_eliminate.empty();
     }
 
     void print_live_GENKILL(Function &F){
@@ -2834,7 +3175,9 @@ struct CAT : public FunctionPass {
 
     }
 
-    void print_live_INOUT(Function &F){
+    void print_live_INOUT(
+        Function &F    
+    ){
         errs() << "Function \"" << F.getName() << "\" " << '\n';
         for (BasicBlock &bb : F){
             for(Instruction &inst : bb){
@@ -2857,15 +3200,52 @@ struct CAT : public FunctionPass {
 
     }
 
+    void print_ref_INOUT(Function &F){
+        errs() << "Function \"" << F.getName() << "\" " << '\n';
+        for (BasicBlock &bb : F){
+            for(Instruction &inst : bb){
+                errs() << "INSTRUCTION: " << inst << '\n';
+                errs() << "***************** ref IN\n{\n";
+                print_set_with_addr(ref_IN[&inst]);
+                
+                errs() << "}\n";
+                errs() << "**************************************\n";
+                errs() << "***************** ref OUT\n{\n";
+
+
+                print_set_with_addr(ref_OUT[&inst]);
+                errs() << "}\n";
+                errs() << "**************************************\n";
+                errs() << "\n\n\n";
+            }
+        }
+
+    }
+
     void live_analysis_wrapper(Function &F, AliasAnalysis & AA){
         errs() << "liveness Analysis on " << F.getName() << '\n';
         live_analysis_init();
         live_analysis_GENKILL(F, AA);
-        live_analysis_INOUT(F);
 
-        print_live_GENKILL(F);
-        print_live_INOUT(F);
+        backward_INOUT(
+            F,
+            live_GEN,
+            live_KILL,
+            live_IN,
+            live_OUT
+        );
+
+        backward_INOUT(
+            F,
+            ref_GEN,
+            ref_KILL,
+            ref_IN,
+            ref_OUT
+        );
+        // print_live_GENKILL(F);
+        // print_live_INOUT(F);
         
+        // print_ref_INOUT(F);
 
         errs() << "Done: liveness Analysis on " << F.getName() << '\n';
     }
