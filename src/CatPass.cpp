@@ -23,7 +23,8 @@
 #include <unordered_map>
 #include <queue>
 #include <chrono>
-// #define CHECK_CONST_AGGRESSIVE 
+// #define CHECK_CONST_AGGRESSIVE
+//#define ENABLE_TIMER
 using namespace llvm;
  
 #define IN_MAP(map, key) (map.find(key) != map.end())
@@ -104,6 +105,8 @@ struct CAT : public ModulePass {
     // std::unordered_map<Value *, std::set<Value *>> val2Ptr; // x->{p | for all p that (p,x) }
     std::unordered_map<Value *, std::set<std::pair<Value*, Value*>>> mptIN;
     std::unordered_map<Value *, std::set<std::pair<Value*, Value*>>> mptOUT;
+
+    std::unordered_map<Value *,std::vector<Value*>> mptBB2CAT;
 
     /**
      * maps from user call to a map from its argument to replacement
@@ -302,20 +305,42 @@ struct CAT : public ModulePass {
     // The LLVM IR of the input functions is ready and it can be analyzed and/or transformed
     class Timer{
     public:
+
+        Timer(){
+#ifdef ENABLE_TIMER
+            t_begin = std::chrono::high_resolution_clock().now();
+#endif
+        }
+#ifdef ENABLE_TIMER
         std::chrono::time_point<std::chrono::system_clock> t_start;
         std::chrono::time_point<std::chrono::system_clock> t_stop;
+        std::chrono::time_point<std::chrono::system_clock> t_begin;
+#endif
         void start(){
+#ifdef ENABLE_TIMER
             t_start = std::chrono::high_resolution_clock().now();
+#endif
         }
         void stop(){
+#ifdef ENABLE_TIMER
             t_stop = std::chrono::high_resolution_clock().now();
+#endif
         }
         void printDuration(std::string const & str){
+#ifdef ENABLE_TIMER
             errs()<<str<<":"<<std::chrono::duration_cast<std::chrono::milliseconds>(t_stop - t_start).count()<<" ms\n";
+#endif
+        }
+        void printEnd(){
+#ifdef ENABLE_TIMER
+            stop();
+            errs()<<"TOTAL:"<<std::chrono::duration_cast<std::chrono::milliseconds>(t_stop - t_begin).count()<<" ms\n";
+#endif
         }
     };
+    Timer timer;
     bool runOnModule (Module &M) override {
-        Timer timer;
+
         CallGraph &CG = getAnalysis<CallGraphWrapperPass>().getCallGraph();
         timer.start();
         bool inlined = function_inline(M, CG);
@@ -366,6 +391,7 @@ struct CAT : public ModulePass {
                 }
             }
         }
+        timer.printEnd();
         return false;
     }
 
@@ -925,7 +951,8 @@ struct CAT : public ModulePass {
 
                     select_trace_back(ptrOperand, ptr_collect);
                     select_trace_back(valueStored, value_collect);
-                    
+
+                    mptBB2CAT[&bb].push_back(&inst);
                     for (Value * ptr : ptr_collect) {
                         for (Value * val : value_collect) {
                             
@@ -941,6 +968,7 @@ struct CAT : public ModulePass {
                     Function * callee_ptr = call_instr->getCalledFunction();
 
                     if (IS_CAT_OP(callee_ptr)) {
+                        mptBB2CAT[&bb].push_back(&inst);
                         /**
                          *  Do nothing. CAT operation never changes point-to analysis
                          * */
@@ -963,8 +991,8 @@ struct CAT : public ModulePass {
                                      *      To be conservative, we say it points to everything and 
                                      * */
                                     Value * dummy = build_constint(0);
-                                    
 
+                                    mptBB2CAT[&bb].push_back(&inst);
                                     mptGEN[&inst].insert(
                                         std::make_pair(arg, dummy)
                                     );
@@ -982,6 +1010,8 @@ struct CAT : public ModulePass {
                          *  Do nothing. standard lib function
                          * */
                     }
+                }else if(isa<LoadInst>(&inst)||isa<PHINode>(&inst)||isa<SelectInst>(&inst)){
+                    mptBB2CAT[&bb].push_back(&inst);
                 }
             }
         }
@@ -1151,6 +1181,17 @@ struct CAT : public ModulePass {
         }   
 
         if (tempOut != mptOUT[inst]) {
+//            errs()<<"BASIC BLOCK:\n";
+//            errs()<<*inst->getParent()<<"\n";
+//            errs()<<"INST:"<<*inst<<"\n";
+//            errs()<<"BEFORE:\n";
+//            for(auto& t:mptOUT[inst]){
+//                errs()<<*t.first<<","<<*t.second<<"\n";
+//            }
+//            errs()<<"AFTER:\n";
+//            for(auto& t:tempOut){
+//                errs()<<*t.first<<","<<*t.second<<"\n";
+//            }
             mptOUT[inst] = tempOut;
             return true;
         }
@@ -1161,42 +1202,130 @@ struct CAT : public ModulePass {
     void mptIN_OUT(Function &F){
         std::set<BasicBlock *> bb_calced;
 
+        std::set<BasicBlock *> workList;
+        std::unordered_map<Value *, std::set<std::pair<Value*,Value*>>> mptBB_GEN;
+        std::unordered_map<Value *, std::set<std::pair<Value*,Value*>>> mptBB_KILL;
+        std::unordered_map<Value *, std::set<std::pair<Value*,Value*>>> mptBB_IN;
+        std::unordered_map<Value *, std::set<std::pair<Value*,Value*>>> mptBB_OUT;
+        for(auto &B: F){
+            mptBB_IN[&B].clear();
+            mptBB_OUT[&B].clear();
+            for(auto &I:mptBB2CAT[&B]){
+                mptBB_GEN[&B].insert(mptGEN[I].begin(),mptGEN[I].end());
+                mptBB_KILL[&B].insert(mptKILL[I].begin(),mptKILL[I].end());
+            }
+        }
+        //errs()<<"BREAK POINT 1\n";
+//        bool changed;
+//        do{
+//            changed = false;
+//            for(BasicBlock &bb : F){
+//                for(BasicBlock *Pred : predecessors(&bb)){
+//                    std::set<std::pair<Value*, Value*>> temp3;
+//                    set_union(mptBB_IN[&bb],mptBB_OUT[Pred],temp3);
+//                    mptBB_IN[&bb]=temp3;
+//                }
+//                std::set<std::pair<Value*, Value*>>  out;
+//                std::set<std::pair<Value*, Value*>>  temp;
+//                //  TEMP = (IN[i]-KILL[i])
+//                set_diff(mptBB_IN[&bb],mptBB_KILL[&bb],temp);
+//                //  OUT = GEN[i] U TEMP
+//                set_union(mptBB_GEN[&bb],temp,out);
+//
+//                if(!changed){
+//                    changed = (out!=mptBB_OUT[&bb]);
+//                }
+//                mptBB_OUT[&bb] = out;
+//            }
+//
+//        }while(changed);
+
+
+
         bool changed;
         do {
             changed = false;
             for (BasicBlock & bb : F) {
-                Instruction * first_inst = &(*bb.begin()); 
-                
+                Instruction *first_inst;
+                //errs()<<"BREAK POINT 1\n";
+                if(mptBB2CAT[&bb].empty()){
+                    first_inst = &(*bb.begin());
+                }else{
+                    first_inst =cast<Instruction>(mptBB2CAT[&bb].front());
+                }
+                //errs()<<"BREAK POINT 2\n";
+
+                //errs()<<"NOT EMPTY\n";
+                //Instruction * first_inst = &(*bb.begin());
+
+                //errs()<<"BREAK POINT 2\n";
                 /**
                  *  Calculate IN of first instruction from OUT of predessors
                  * */
+                //mptIN[first_inst].clear();
                 for (BasicBlock * predBB : predecessors(&bb)) {
-                    Instruction * predBB_terminator = predBB->getTerminator();
+                    //Instruction * predBB_terminator = predBB->getTerminator();
+                    Value *predBBTerminator;
+                    if(mptBB2CAT[predBB].empty()){
+                        predBBTerminator = predBB->getTerminator();
+                    }else{
+                        predBBTerminator = mptBB2CAT[predBB].back();
+                    }
+                    // IN[B] = U<p is predecessors of B>OUT[p]?
 
                     mptIN[first_inst].insert(
-                        mptOUT[predBB_terminator].begin(),
-                        mptOUT[predBB_terminator].end()
+                        mptOUT[predBBTerminator].begin(),
+                        mptOUT[predBBTerminator].end()
                     );
+                    //errs()<<"BREAK POINT 3\n";
                 }
 
                 bool first_out_changed = calc_mpt_IN2OUT(first_inst);
-                
+                //errs()<<"CHANGING:"<<first_out_changed<<"\n";
+//                for(auto& p:mptOUT[first_inst]){
+//                    errs()<<*p.first<<", "<<*p.second<<"\n";
+//                }
+//                for(auto& p:mptOUT[first_inst]){
+//                    errs()<<p.first<<", "<<p.second<<"\n";
+//                }
+
                 if (!changed) changed = first_out_changed;
 
                 if (first_out_changed  || !IN_SET(bb_calced, &bb)) {
                     std::set<std::pair<Value*,Value*>> prevOut = mptOUT[first_inst];
+                    //errs()<<"BREAK POINT 4\n";
+                    if(mptBB2CAT[&bb].empty()){
+                        //errs()<<"EMPTY\n";
+                        Instruction *terminator = bb.getTerminator();
+                        mptIN[terminator] = prevOut;
+                        //mptOUT[terminator] = prevOut;
+                        //errs()<<"BREAK POINT 7\n";
+                        calc_mpt_IN2OUT(terminator);
+                        //errs()<<"BREAK POINT 8\n";
+                    }else{
+                        for(auto &I:mptBB2CAT[&bb]){
+                            Instruction * cur_ptr = cast<Instruction>(I);
+                            mptIN[cur_ptr] = prevOut;
 
-                    for (auto iter = (++bb.begin()); iter != bb.end(); iter++) {
-                        Instruction * cur_ptr = &*iter;
-                        mptIN[cur_ptr] = prevOut;
+                            calc_mpt_IN2OUT(cur_ptr);
 
-                        calc_mpt_IN2OUT(cur_ptr);
-
-                        prevOut = mptOUT[cur_ptr];
+                            prevOut = mptOUT[cur_ptr];
+                            //errs()<<"BREAK POINT 5\n";
+                        }
                     }
 
+
+//                    for (auto iter = (++bb.begin()); iter != bb.end(); iter++) {
+//                        Instruction * cur_ptr = &*iter;
+//                        mptIN[cur_ptr] = prevOut;
+//
+//                        calc_mpt_IN2OUT(cur_ptr);
+//
+//                        prevOut = mptOUT[cur_ptr];
+//                    }
+
                     bb_calced.insert(&bb);
-                } 
+                }
 
             }
 
@@ -1204,6 +1333,52 @@ struct CAT : public ModulePass {
 
 
     }
+        void mptIN_OUT_backup(Function &F){
+            std::set<BasicBlock *> bb_calced;
+
+            bool changed;
+            do {
+                changed = false;
+                for (BasicBlock & bb : F) {
+                    Instruction * first_inst = &(*bb.begin());
+
+                    /**
+                     *  Calculate IN of first instruction from OUT of predessors
+                     * */
+                    for (BasicBlock * predBB : predecessors(&bb)) {
+                        Instruction * predBB_terminator = predBB->getTerminator();
+
+                        mptIN[first_inst].insert(
+                                mptOUT[predBB_terminator].begin(),
+                                mptOUT[predBB_terminator].end()
+                        );
+                    }
+
+                    bool first_out_changed = calc_mpt_IN2OUT(first_inst);
+
+                    if (!changed) changed = first_out_changed;
+
+                    if (first_out_changed  || !IN_SET(bb_calced, &bb)) {
+                        std::set<std::pair<Value*,Value*>> prevOut = mptOUT[first_inst];
+
+                        for (auto iter = (++bb.begin()); iter != bb.end(); iter++) {
+                            Instruction * cur_ptr = &*iter;
+                            mptIN[cur_ptr] = prevOut;
+
+                            calc_mpt_IN2OUT(cur_ptr);
+
+                            prevOut = mptOUT[cur_ptr];
+                        }
+
+                        bb_calced.insert(&bb);
+                    }
+
+                }
+
+            } while(changed);
+
+
+        }
     
 
     void findCATVar(Function &F){
@@ -1233,7 +1408,7 @@ struct CAT : public ModulePass {
 
     void mpt_wrap(Function &F, AliasAnalysis & AA) {
         //errs() << "MPT Analysis on " << F.getName() << '\n';
-            Timer timer;
+            //Timer timer;
             timer.start();
         mpt_init();
         mptGEN_KILL(F, AA);
@@ -1358,7 +1533,7 @@ struct CAT : public ModulePass {
         BasicBlock *entry = &F.getEntryBlock();
         for (Argument &arg:  F.args()){
             if (isa<PointerType>(arg.getType())) {
-                BB2CAT[entry].push_back(&arg);
+                //BB2CAT[entry].push_back(&arg);
        
                 arg_set.insert(&arg);
 
@@ -1534,23 +1709,20 @@ struct CAT : public ModulePass {
 
             workList.insert(&bb);
 
-            for(llvm::Instruction &inst :bb){
-
-                if (IN_MAP(userCall2replace, &inst)){
-                    calc_BB_GEN_KILL(&inst, &bb);
-                    for (auto & kv : userCall2replace[&inst]) {
+            for(auto& I: BB2CAT[&bb]){
+                if(!isa<Instruction>(I))
+                    continue;
+                Instruction *inst = cast<Instruction>(I);
+                if (IN_MAP(userCall2replace, inst)){
+                    calc_BB_GEN_KILL(inst, &bb);
+                    for (auto & kv : userCall2replace[inst]) {
                         Instruction * dummy_instr = kv.second;
                         calc_BB_GEN_KILL(dummy_instr, &bb);
                     }
                 } else {
-                    calc_BB_GEN_KILL(&inst, &bb);
+                    calc_BB_GEN_KILL(inst, &bb);
                 }
             }
-
-            // errs() << "Basic block GEN : " << bb << '\n';
-            // print_set_with_addr(sBB_GEN[&bb]);
-            // errs() << "Basic block KILL : " << bb << '\n';
-            // print_set_with_addr(sBB_KILL[&bb]);
         }
 
         /**
@@ -1566,7 +1738,6 @@ struct CAT : public ModulePass {
          * TODO: optimize with worklist!!
          * */
         std::set<Value*> oldOUT;
-        std::vector<BasicBlock*> tWorkList;
         while(!workList.empty()){
             BasicBlock *B = *workList.begin();
             workList.erase(B);
@@ -1764,7 +1935,7 @@ struct CAT : public ModulePass {
     }
     void reachingDef_wrap(Function &F, AliasAnalysis & AA) {
         //errs() << "Reaching definition on " << F.getName() << '\n';
-        Timer timer;
+        //Timer timer;
             timer.start();
         sGEN_sKILL_init();
         sGEN_sKILL(F, AA);
