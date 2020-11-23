@@ -1450,6 +1450,7 @@ struct CAT : public ModulePass {
                         //errs()<<"BREAK POINT 8\n";
                     }else{
                         for(auto &I:mptBB2CAT[&bb]){
+                            if (I == mptBB2CAT[&bb].front()) continue;
                             Instruction * cur_ptr = cast<Instruction>(I);
                             mptIN[cur_ptr] = prevOut;
 
@@ -1563,7 +1564,7 @@ struct CAT : public ModulePass {
 
             timer.start();
         // mptIN_OUT(F);
-        mptIN_OUT_backup(F);
+        mptIN_OUT(F);
             timer.stop();
             timer.printDuration("\t\tMPT IN-OUT ");
         //errs() << "Done: MPT Analysis on " << F.getName() << '\n';
@@ -1893,11 +1894,15 @@ struct CAT : public ModulePass {
             /**
              * IN[B] = U <p pred of B> OUT[p]
              */
+            std::set<Value*> preds;
             for(BasicBlock *Pred : predecessors(B)){
-                std::set<Value*> temp3;
-                set_union(sBB_IN[B],sBB_OUT[Pred],temp3);
-                sBB_IN[B]=temp3;
+                // std::set<Value*> temp3;
+                preds.insert(sBB_OUT[Pred].begin(), sBB_OUT[Pred].end());
+                // set_union(sBB_IN[B],sBB_OUT[Pred],temp3);
+                // sBB_IN[B]=temp3;
             }
+            sBB_IN[B]=preds;
+            
             std::set<Value*> out;
             std::set<Value*> temp;
             //  TEMP = (IN[i]-KILL[i])
@@ -3808,25 +3813,29 @@ struct CAT : public ModulePass {
         std::map<Value *, std::set<Value *>> & OUT
     ) {
         std::set<BasicBlock *> bb_calced;
-
+        std::queue<BasicBlock *> workList;
         bool changed;
         do {
             changed = false;
-            for (BasicBlock & bb : F) {
+            auto bblist = &F.getBasicBlockList();
+            // for (BasicBlock & bb : F) {
+            for (auto bb_it = bblist->rbegin(); bb_it != bblist->rend(); bb_it++ ){
                 // Instruction * last_inst = bb.getTerminator(); 
                 // errs() << "Analyzing " << bb ;
+                BasicBlock * bb = &*bb_it;
+
                 Instruction * last_inst;
-                if (liveBB2CAT[&bb].empty()){
-                    last_inst = bb.getTerminator();
+                if (liveBB2CAT[bb].empty()){
+                    last_inst = bb->getTerminator();
                 } else {
-                    last_inst = liveBB2CAT[&bb].back();
+                    last_inst = liveBB2CAT[bb].back();
                 }
                 
                 
                 /**
                  *  Calculate OUT of last instruction from IN of successors
                  * */
-                for (BasicBlock * succBB : successors(&bb)) {
+                for (BasicBlock * succBB : successors(bb)) {
 
                     Instruction * predBB_beginner; 
 
@@ -3846,17 +3855,17 @@ struct CAT : public ModulePass {
                 
                 if (!changed) changed = last_in_changed;
 
-                if (last_in_changed  || !IN_SET(bb_calced, &bb)) {
+                if (last_in_changed  || !IN_SET(bb_calced, bb)) {
                     bool in_changed;
                     std::set<Value *> nextIN = IN[last_inst];
 
-                    if (liveBB2CAT[&bb].empty()){
-                        Instruction * beginner = &*bb.begin();
+                    if (liveBB2CAT[bb].empty()){
+                        Instruction * beginner = &*bb->begin();
                         OUT[beginner] = nextIN;
 
                         calc_live_OUT2IN(beginner, GEN, KILL, IN, OUT);
                     }else {
-                        for (auto iter = (++liveBB2CAT[&bb].rbegin()); iter != liveBB2CAT[&bb].rend(); iter++) {
+                        for (auto iter = (++liveBB2CAT[bb].rbegin()); iter != liveBB2CAT[bb].rend(); iter++) {
                             Instruction * cur_ptr = *iter;
                             OUT[cur_ptr] = nextIN;
 
@@ -3868,21 +3877,9 @@ struct CAT : public ModulePass {
 
                     if (!changed) changed = in_changed;
                     
-                    bb_calced.insert(&bb);
+                    bb_calced.insert(bb);
                 } 
-
-                // errs() << "--------------------------------\n";
-                // errs() << "--------------------------------\n";
-                // print_live_INOUT_BB(bb);
-                // errs() << "--------------------------------\n";
-                // errs() << "--------------------------------\n";
             }
-
-            // errs() << "--------------------------------\n";
-            // errs() << "--------------------------------\n";
-            // print_live_INOUT(F);
-            // errs() << "--------------------------------\n";
-            // errs() << "--------------------------------\n";
         } while(changed);
     }
 
@@ -4016,7 +4013,7 @@ struct CAT : public ModulePass {
                         bool canElim = can_be_eliminated(call_inst);
                         if (canElim){
                             to_eliminate.push_back(call_inst);
-                            errs() << "Eliminating " << *call_inst << '\n';
+                            // errs() << "Eliminating " << *call_inst << '\n';
                         }
                     }
                 }
