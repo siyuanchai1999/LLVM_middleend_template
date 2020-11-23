@@ -24,7 +24,8 @@
 #include <queue>
 #include <chrono>
 // #define CHECK_CONST_AGGRESSIVE
-//#define ENABLE_TIMER
+// #define ENABLE_TIMER
+#define DEBUG_CORRECTNESS
 using namespace llvm;
  
 #define IN_MAP(map, key) (map.find(key) != map.end())
@@ -122,6 +123,18 @@ struct CAT : public ModulePass {
     std::unordered_map<Value *, CycleResult> func2cycle;
 
     std::map<Value * , Value *> auto2def;
+
+    /**
+     *  live_{GEN|KILL|IN|OUT} are for the liveness of values of variables
+     *  ref_{GEN|KILL|IN|OUT} are for the liveness of References of variables
+     * */
+
+    std::map<Value *, std::set<Value *>> live_GEN, live_KILL, live_might_KILL;
+    std::map<Value *, std::set<Value *>> live_IN, live_OUT;
+    
+    std::unordered_map<Value *,std::vector<Instruction*>> liveBB2CAT;
+    // std::map<Value *, std::set<Value *>> ref_GEN, ref_KILL;
+    // std::map<Value *, std::set<Value *>> ref_IN, ref_OUT;
 
 #define IS_PTR_TYPE(val) (isa<PointerType>(val->getType()) )
 #define IS_INT_TYPE(val) (isa<IntegerType>(val->getType()) )
@@ -349,8 +362,11 @@ struct CAT : public ModulePass {
         }
     };
     Timer timer;
-    bool runOnModule (Module &M) override {
 
+#ifdef DEBUG_CORRECTNESS
+    bool runOnModule (Module &M) override {
+        
+        errs() << "DEBUG runOnModule\n";
         CallGraph &CG = getAnalysis<CallGraphWrapperPass>().getCallGraph();
         timer.start();
         bool inlined = function_inline(M, CG);
@@ -410,6 +426,81 @@ struct CAT : public ModulePass {
         timer.printEnd();
         return false;
     }
+
+#else
+
+    bool runOnModule (Module &M) override {
+
+        CallGraph &CG = getAnalysis<CallGraphWrapperPass>().getCallGraph();
+        timer.start();
+        bool inlined = function_inline(M, CG);
+        timer.stop();
+        timer.printDuration("INLINE ");
+        if (!inlined){
+            std::set<Function *> usedFunction;
+            getUsedFunction(CG,M,usedFunction);
+            for (auto & F: usedFunction){
+                if (!F->empty()){
+
+                    bool folded = false, propogated = false;
+                    errs()<<"IN Function:"<<F->getName()<<"\n";
+                    AliasAnalysis & AA = getAnalysis<AAResultsWrapperPass>(*F).getAAResults();
+                       timer.start();
+                    CATNewElimination(*F);
+                       timer.stop();
+                       timer.printDuration("\tCAT NEW ELIMINATION ");
+                       
+                       timer.start();
+                    mpt_wrap(*F, AA);
+                       timer.stop();
+                       timer.printDuration("\tMPT1");
+
+                       timer.start();
+                    reachingDef_wrap(*F, AA);
+                       timer.stop();
+                       timer.printDuration("\tREACHING DEF1 ");
+//
+                        timer.start();
+                    folded = constant_folding(*F, AA);
+                        timer.stop();
+                        timer.printDuration("\tCONST FOLDING");
+
+                        timer.start();
+                    mpt_wrap(*F, AA);
+                        timer.stop();
+                        timer.printDuration("\tMPT2 ");
+                        
+                        timer.start();
+                    reachingDef_wrap(*F, AA);
+//                            timer.stop();
+//                            timer.printDuration("\tREACHING DEF2 ");
+                        timer.start();
+                    propogated = constant_propagation(*F, AA);
+                        timer.stop();
+                        timer.printDuration("\tPROPAGATION:");
+
+                        timer.start();
+                    mpt_wrap(*F, AA);
+                        timer.stop();
+                        timer.printDuration("\tMPT3 :");
+
+                        timer.start();
+                    live_analysis_wrapper(*F, AA);
+                        timer.stop();
+                        timer.printDuration("\tlive Analysis");
+
+                        timer.start();
+                    eliminating(*F, AA);
+                        timer.stop();
+                        timer.printDuration("\tEliminating");
+                }
+            }
+        }
+        timer.printEnd();
+        return false;
+    }
+#endif
+
 
     void getUsedFunction(CallGraph &CG,Module &M,std::set<Function *> &usedFunction){
         Function *mainF = M.getFunction("main");
@@ -3358,16 +3449,6 @@ struct CAT : public ModulePass {
         }
     }
 
-    /**
-     *  live_{GEN|KILL|IN|OUT} are for the liveness of values of variables
-     *  ref_{GEN|KILL|IN|OUT} are for the liveness of References of variables
-     * */
-
-    std::map<Value *, std::set<Value *>> live_GEN, live_KILL, live_might_KILL;
-    std::map<Value *, std::set<Value *>> live_IN, live_OUT;
-    std::map<Value *, std::set<Value *>> ref_GEN, ref_KILL;
-    std::map<Value *, std::set<Value *>> ref_IN, ref_OUT;
-
     void live_analysis_init() {
         // std::map<Value *, std::set<Value *>> live_GEN, live_KILL;
         // std::map<Value *, std::set<Value *>> live_IN, live_OUT;
@@ -3406,10 +3487,10 @@ struct CAT : public ModulePass {
         might_alias(inst, used_var, aliases);
         live_GEN[inst].insert(aliases.begin(), aliases.end());
 
-        errs() << "At " << *inst  << *used_var << " might alias "  << '\n';
-        for (Value * might_a: aliases) {
-            errs() << *might_a << '\n';
-        }
+        // errs() << "At " << *inst  << *used_var << " might alias "  << '\n';
+        // for (Value * might_a: aliases) {
+        //     errs() << *might_a << '\n';
+        // }
 
         Value * auto_res;
         bool is_auto = CAT_auto_trace_back(used_var, &auto_res);
@@ -3458,12 +3539,14 @@ struct CAT : public ModulePass {
                 if(fptr){
                     CallInst * call_instr = cast<CallInst>(&inst);
                     if (IS_CAT_OP(fptr)){
+                        liveBB2CAT[&bb].push_back(call_instr);
+
                         // errs() << "analyzing " << *call_instr << '\n';
                         if (IS_CAT_new(fptr)){
                             // only define but not killed
                             live_KILL[&inst].insert(&inst);
                             
-                            ref_KILL[&inst].insert(&inst);
+                            // ref_KILL[&inst].insert(&inst);
                             
                         } else if (IS_CAT_get(fptr)) {
                             /**
@@ -3473,7 +3556,7 @@ struct CAT : public ModulePass {
                             
                             live_GEN_populate(call_instr, arg0);
 
-                            ref_GEN[&inst].insert(arg0);
+                            // ref_GEN[&inst].insert(arg0);
                             
                         } else if (IS_CAT_set(fptr)) {
                             // CAT_set, define and usearg0
@@ -3483,7 +3566,7 @@ struct CAT : public ModulePass {
 
                             live_KILL_populate(call_instr, arg0);
 
-                            ref_GEN[&inst].insert(arg0);
+                            // ref_GEN[&inst].insert(arg0);
                         } else {
                             // CAT_add, CAT_sub
                             // define arg0
@@ -3499,12 +3582,13 @@ struct CAT : public ModulePass {
 
                             live_GEN_populate(call_instr, arg2);
 
-                            ref_GEN[&inst].insert(arg0);
-                            ref_GEN[&inst].insert(arg1);
-                            ref_GEN[&inst].insert(arg2);
+                            // ref_GEN[&inst].insert(arg0);
+                            // ref_GEN[&inst].insert(arg1);
+                            // ref_GEN[&inst].insert(arg2);
                         }   
 
                     } else if (IS_USER_FUNC(fptr)){
+                        liveBB2CAT[&bb].push_back(call_instr);
                         uint32_t arg_cnt = call_instr->getNumArgOperands();
                         for(uint32_t i = 0; i < arg_cnt; i++){
                             Value * arg = call_instr->getArgOperand(i);
@@ -3541,7 +3625,7 @@ struct CAT : public ModulePass {
                                 // }
                                 live_KILL[&inst].insert(arg);
                                 live_GEN[&inst].insert(arg);
-                                ref_GEN[&inst].insert(arg);
+                                // ref_GEN[&inst].insert(arg);
                             }
                         
                         }
@@ -3553,34 +3637,40 @@ struct CAT : public ModulePass {
                     }
 
                 } else if (isa<PHINode>(&inst)){
+
                     PHINode * phi = cast<PHINode>(&inst);
+                    
                     if (IS_PTR_TYPE(phi)) {
                         live_KILL[phi].insert(phi);
-                        ref_KILL[phi].insert(phi);
+                        // ref_KILL[phi].insert(phi);
 
                         uint32_t numIncome =  phi->getNumIncomingValues();
 
                         for (uint32_t i = 0; i < numIncome; i++) {
                             Value * in_value = phi->getIncomingValue(i);
                             live_GEN[phi].insert(in_value);
-                            ref_GEN[phi].insert(in_value);
+                            // ref_GEN[phi].insert(in_value);
                         }
+                        
+                        liveBB2CAT[&bb].push_back(phi);
                     }
 
                 } else if (isa<SelectInst>(&inst)){
                     SelectInst * select_inst = cast<SelectInst>(&inst);
                     if (IS_PTR_TYPE(select_inst)) {
                         live_KILL[select_inst].insert(select_inst);
-                        ref_KILL[select_inst].insert(select_inst);
+                        // ref_KILL[select_inst].insert(select_inst);
 
                         Value * op1 = select_inst->getOperand(1);
                         Value * op2 = select_inst->getOperand(2);
                         
                         live_GEN[select_inst].insert(op1);
-                        ref_GEN[select_inst].insert(op1);
+                        // ref_GEN[select_inst].insert(op1);
 
                         live_GEN[select_inst].insert(op2);
-                        ref_GEN[select_inst].insert(op2);
+                        // ref_GEN[select_inst].insert(op2);
+
+                        liveBB2CAT[&bb].push_back(select_inst);
                     }   
 
                 } 
@@ -3717,6 +3807,60 @@ struct CAT : public ModulePass {
         do {
             changed = false;
             for (BasicBlock & bb : F) {
+                // Instruction * last_inst = bb.getTerminator(); 
+                if (liveBB2CAT[&bb].empty()) continue;
+                Instruction * last_inst = liveBB2CAT[&bb].back();
+                /**
+                 *  Calculate OUT of last instruction from IN of successors
+                 * */
+                for (BasicBlock * succBB : successors(&bb)) {
+                    Instruction * predBB_terminator = liveBB2CAT[&bb].front();
+
+                    OUT[last_inst].insert(
+                        IN[predBB_terminator].begin(),
+                        IN[predBB_terminator].end()
+                    );
+                }
+
+                bool last_in_changed = calc_live_OUT2IN(last_inst, GEN, KILL, IN, OUT);
+                
+                if (!changed) changed = last_in_changed;
+
+                if (last_in_changed  || !IN_SET(bb_calced, &bb)) {
+                    bool in_changed;
+                    std::set<Value *> nextIN = IN[last_inst];
+
+                    for (auto iter = (++liveBB2CAT[&bb].rbegin()); iter != liveBB2CAT[&bb].rend(); iter++) {
+                        Instruction * cur_ptr = *iter;
+                        OUT[cur_ptr] = nextIN;
+
+                        in_changed = calc_live_OUT2IN(cur_ptr, GEN, KILL, IN, OUT);
+
+                        nextIN = IN[cur_ptr];
+                    }
+
+                    if (!changed) changed = in_changed;
+                    bb_calced.insert(&bb);
+                } 
+
+            }
+
+        } while(changed);
+    }
+
+    void backward_INOUT_backup(
+        Function & F,
+        std::map<Value *, std::set<Value *>> & GEN,
+        std::map<Value *, std::set<Value *>> & KILL,
+        std::map<Value *, std::set<Value *>> & IN,
+        std::map<Value *, std::set<Value *>> & OUT
+    ) {
+        std::set<BasicBlock *> bb_calced;
+
+        bool changed;
+        do {
+            changed = false;
+            for (BasicBlock & bb : F) {
                 Instruction * last_inst = bb.getTerminator(); 
                 
                 /**
@@ -3756,7 +3900,6 @@ struct CAT : public ModulePass {
 
         } while(changed);
     }
-
 
     /**
      *  Return if def which is defined by inst has contruction outside the function
@@ -3897,54 +4040,60 @@ struct CAT : public ModulePass {
 
     }
 
-    void print_ref_INOUT(Function &F){
-        errs() << "Function \"" << F.getName() << "\" " << '\n';
-        for (BasicBlock &bb : F){
-            for(Instruction &inst : bb){
-                errs() << "INSTRUCTION: " << inst << '\n';
-                errs() << "***************** ref IN\n{\n";
-                print_set_with_addr(ref_IN[&inst]);
+    // void print_ref_INOUT(Function &F){
+    //     errs() << "Function \"" << F.getName() << "\" " << '\n';
+    //     for (BasicBlock &bb : F){
+    //         for(Instruction &inst : bb){
+    //             errs() << "INSTRUCTION: " << inst << '\n';
+    //             errs() << "***************** ref IN\n{\n";
+    //             print_set_with_addr(ref_IN[&inst]);
                 
-                errs() << "}\n";
-                errs() << "**************************************\n";
-                errs() << "***************** ref OUT\n{\n";
+    //             errs() << "}\n";
+    //             errs() << "**************************************\n";
+    //             errs() << "***************** ref OUT\n{\n";
 
 
-                print_set_with_addr(ref_OUT[&inst]);
-                errs() << "}\n";
-                errs() << "**************************************\n";
-                errs() << "\n\n\n";
-            }
-        }
+    //             print_set_with_addr(ref_OUT[&inst]);
+    //             errs() << "}\n";
+    //             errs() << "**************************************\n";
+    //             errs() << "\n\n\n";
+    //         }
+    //     }
 
-    }
+    // }
 
     void live_analysis_wrapper(Function &F, AliasAnalysis & AA){
-        errs() << "liveness Analysis on " << F.getName() << '\n';
+        // errs() << "liveness Analysis on " << F.getName() << '\n';
         live_analysis_init();
+        
+            timer.start();
         live_analysis_GENKILL(F, AA);
-
-        backward_INOUT(
+            timer.stop();
+            timer.printDuration("\t\tLIVE GEN-KILL ");
+        
+            timer.start();  
+        backward_INOUT_backup(
             F,
             live_GEN,
             live_KILL,
             live_IN,
             live_OUT
         );
-
-        backward_INOUT(
-            F,
-            ref_GEN,
-            ref_KILL,
-            ref_IN,
-            ref_OUT
-        );
+            timer.stop();
+            timer.printDuration("\t\tLIVE IN-OUT ");
+        // backward_INOUT(
+        //     F,
+        //     ref_GEN,
+        //     ref_KILL,
+        //     ref_IN,
+        //     ref_OUT
+        // );
         // print_live_GENKILL(F);
         // print_live_INOUT(F);
         
         // print_ref_INOUT(F);
 
-        errs() << "Done: liveness Analysis on " << F.getName() << '\n';
+        // errs() << "Done: liveness Analysis on " << F.getName() << '\n';
     }
     
     // eliminating(F, AA);
