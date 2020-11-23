@@ -978,6 +978,7 @@ struct CAT : public ModulePass {
 
         arg_set.clear();
         BB2CAT.clear();
+
     }
 
     void mpt_init() {
@@ -992,6 +993,7 @@ struct CAT : public ModulePass {
         mptIN.clear();
         mptOUT.clear();
         ptr2Val.clear();
+        mptBB2CAT.clear();
     }
     
     bool CAT_auto_trace_back(Value * val, Value ** real) {
@@ -1076,6 +1078,7 @@ struct CAT : public ModulePass {
         for(auto &bb : F){
             for(auto &inst: bb){
                 if(isa<StoreInst>(&inst)){
+                    mptBB2CAT[&bb].push_back(&inst);
                     StoreInst *storeInst = cast<StoreInst>(&inst);
                     Value *valueStored = storeInst->getValueOperand();
                     Value *ptrOperand = storeInst->getPointerOperand();
@@ -1115,6 +1118,7 @@ struct CAT : public ModulePass {
                          *  Do nothing. CAT operation never changes point-to analysis
                          * */
                     } else if (IS_USER_FUNC(callee_ptr)) {
+                        mptBB2CAT[&bb].push_back(&inst);
                         uint32_t num_arg = call_instr->getNumArgOperands();
                         for (uint32_t i = 0; i < num_arg; i++) {
                             Value * arg = call_instr->getArgOperand(i);
@@ -1134,7 +1138,7 @@ struct CAT : public ModulePass {
                                      * */
                                     Value * dummy = build_constint(0);
 
-                                    mptBB2CAT[&bb].push_back(&inst);
+                                    
                                     mptGEN[&inst].insert(
                                         std::make_pair(arg, dummy)
                                     );
@@ -1344,19 +1348,19 @@ struct CAT : public ModulePass {
     void mptIN_OUT(Function &F){
         std::set<BasicBlock *> bb_calced;
 
-        std::set<BasicBlock *> workList;
-        std::unordered_map<Value *, std::set<std::pair<Value*,Value*>>> mptBB_GEN;
-        std::unordered_map<Value *, std::set<std::pair<Value*,Value*>>> mptBB_KILL;
-        std::unordered_map<Value *, std::set<std::pair<Value*,Value*>>> mptBB_IN;
-        std::unordered_map<Value *, std::set<std::pair<Value*,Value*>>> mptBB_OUT;
-        for(auto &B: F){
-            mptBB_IN[&B].clear();
-            mptBB_OUT[&B].clear();
-            for(auto &I:mptBB2CAT[&B]){
-                mptBB_GEN[&B].insert(mptGEN[I].begin(),mptGEN[I].end());
-                mptBB_KILL[&B].insert(mptKILL[I].begin(),mptKILL[I].end());
-            }
-        }
+        // std::set<BasicBlock *> workList;
+        // std::unordered_map<Value *, std::set<std::pair<Value*,Value*>>> mptBB_GEN;
+        // std::unordered_map<Value *, std::set<std::pair<Value*,Value*>>> mptBB_KILL;
+        // std::unordered_map<Value *, std::set<std::pair<Value*,Value*>>> mptBB_IN;
+        // std::unordered_map<Value *, std::set<std::pair<Value*,Value*>>> mptBB_OUT;
+        // for(auto &B: F){
+        //     mptBB_IN[&B].clear();
+        //     mptBB_OUT[&B].clear();
+        //     for(auto &I:mptBB2CAT[&B]){
+        //         mptBB_GEN[&B].insert(mptGEN[I].begin(),mptGEN[I].end());
+        //         mptBB_KILL[&B].insert(mptKILL[I].begin(),mptKILL[I].end());
+        //     }
+        // }
         //errs()<<"BREAK POINT 1\n";
 //        bool changed;
 //        do{
@@ -3457,6 +3461,8 @@ struct CAT : public ModulePass {
         live_KILL.clear();
         live_IN.clear();
         live_OUT.clear();
+
+        liveBB2CAT.clear();
     }
 
 
@@ -3808,17 +3814,31 @@ struct CAT : public ModulePass {
             changed = false;
             for (BasicBlock & bb : F) {
                 // Instruction * last_inst = bb.getTerminator(); 
-                if (liveBB2CAT[&bb].empty()) continue;
-                Instruction * last_inst = liveBB2CAT[&bb].back();
+                // errs() << "Analyzing " << bb ;
+                Instruction * last_inst;
+                if (liveBB2CAT[&bb].empty()){
+                    last_inst = bb.getTerminator();
+                } else {
+                    last_inst = liveBB2CAT[&bb].back();
+                }
+                
+                
                 /**
                  *  Calculate OUT of last instruction from IN of successors
                  * */
                 for (BasicBlock * succBB : successors(&bb)) {
-                    Instruction * predBB_terminator = liveBB2CAT[&bb].front();
+
+                    Instruction * predBB_beginner; 
+
+                     if (liveBB2CAT[succBB].empty()){
+                        predBB_beginner = &*succBB->begin();
+                    } else {
+                        predBB_beginner = liveBB2CAT[succBB].front();
+                    }
 
                     OUT[last_inst].insert(
-                        IN[predBB_terminator].begin(),
-                        IN[predBB_terminator].end()
+                        IN[predBB_beginner].begin(),
+                        IN[predBB_beginner].end()
                     );
                 }
 
@@ -3830,21 +3850,39 @@ struct CAT : public ModulePass {
                     bool in_changed;
                     std::set<Value *> nextIN = IN[last_inst];
 
-                    for (auto iter = (++liveBB2CAT[&bb].rbegin()); iter != liveBB2CAT[&bb].rend(); iter++) {
-                        Instruction * cur_ptr = *iter;
-                        OUT[cur_ptr] = nextIN;
+                    if (liveBB2CAT[&bb].empty()){
+                        Instruction * beginner = &*bb.begin();
+                        OUT[beginner] = nextIN;
 
-                        in_changed = calc_live_OUT2IN(cur_ptr, GEN, KILL, IN, OUT);
+                        calc_live_OUT2IN(beginner, GEN, KILL, IN, OUT);
+                    }else {
+                        for (auto iter = (++liveBB2CAT[&bb].rbegin()); iter != liveBB2CAT[&bb].rend(); iter++) {
+                            Instruction * cur_ptr = *iter;
+                            OUT[cur_ptr] = nextIN;
 
-                        nextIN = IN[cur_ptr];
+                            in_changed = calc_live_OUT2IN(cur_ptr, GEN, KILL, IN, OUT);
+
+                            nextIN = IN[cur_ptr];
+                        }
                     }
 
                     if (!changed) changed = in_changed;
+                    
                     bb_calced.insert(&bb);
                 } 
 
+                // errs() << "--------------------------------\n";
+                // errs() << "--------------------------------\n";
+                // print_live_INOUT_BB(bb);
+                // errs() << "--------------------------------\n";
+                // errs() << "--------------------------------\n";
             }
 
+            // errs() << "--------------------------------\n";
+            // errs() << "--------------------------------\n";
+            // print_live_INOUT(F);
+            // errs() << "--------------------------------\n";
+            // errs() << "--------------------------------\n";
         } while(changed);
     }
 
@@ -4040,6 +4078,29 @@ struct CAT : public ModulePass {
 
     }
 
+    void print_live_INOUT_BB(
+        BasicBlock & BB    
+    ){
+        // errs() << "Function \"" << F.getName() << "\" " << '\n';
+        for(Instruction &inst : BB){
+            errs() << "INSTRUCTION: " << inst << '\n';
+            errs() << "***************** live IN\n{\n";
+            // print_set(sIN[&inst]);
+            print_set_with_addr(live_IN[&inst]);
+            errs() << "}\n";
+            errs() << "**************************************\n";
+            errs() << "***************** live OUT\n{\n";
+
+
+            // print_set(sOUT[&inst]);
+            print_set_with_addr(live_OUT[&inst]);
+            errs() << "}\n";
+            errs() << "**************************************\n";
+            errs() << "\n\n\n";
+        }
+
+    }
+
     // void print_ref_INOUT(Function &F){
     //     errs() << "Function \"" << F.getName() << "\" " << '\n';
     //     for (BasicBlock &bb : F){
@@ -4072,7 +4133,7 @@ struct CAT : public ModulePass {
             timer.printDuration("\t\tLIVE GEN-KILL ");
         
             timer.start();  
-        backward_INOUT_backup(
+        backward_INOUT(
             F,
             live_GEN,
             live_KILL,
