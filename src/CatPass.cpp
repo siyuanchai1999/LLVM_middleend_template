@@ -24,8 +24,8 @@
 #include <queue>
 #include <chrono>
 // #define CHECK_CONST_AGGRESSIVE
-// #define ENABLE_TIMER
-#define DEBUG_CORRECTNESS
+#define ENABLE_TIMER
+// #define DEBUG_CORRECTNESS
 using namespace llvm;
  
 #define IN_MAP(map, key) (map.find(key) != map.end())
