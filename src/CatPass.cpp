@@ -449,12 +449,12 @@ struct CAT : public ModulePass {
                     CATNewElimination(*F);
                        timer.stop();
                        timer.printDuration("\tCAT NEW ELIMINATION ");
-                       
+
                        timer.start();
                     mpt_wrap(*F, AA);
                        timer.stop();
                        timer.printDuration("\tMPT1");
-
+//
                        timer.start();
                     reachingDef_wrap(*F, AA);
                        timer.stop();
@@ -469,11 +469,11 @@ struct CAT : public ModulePass {
                     mpt_wrap(*F, AA);
                         timer.stop();
                         timer.printDuration("\tMPT2 ");
-                        
+
                         timer.start();
                     reachingDef_wrap(*F, AA);
-//                            timer.stop();
-//                            timer.printDuration("\tREACHING DEF2 ");
+                            timer.stop();
+                            timer.printDuration("\tREACHING DEF2 ");
                         timer.start();
                     propogated = constant_propagation(*F, AA);
                         timer.stop();
@@ -1829,15 +1829,17 @@ struct CAT : public ModulePass {
             sBB_GEN[bb].insert(inst);
         }
         //TODO:Optimize
-        std::set<Value*> temp;
-        set_union(sBB_KILL[bb],sKILL[inst],temp);
-        sBB_KILL[bb]=temp;
+//        std::set<Value*> temp;
+//        set_union(sBB_KILL[bb],sKILL[inst],temp);
+//        sBB_KILL[bb]=temp;
+
+        sBB_KILL[bb].insert(sKILL[inst].begin(),sKILL[inst].end());
 
         std::set<Value*> temp2;
         set_diff(sBB_GEN[bb],sKILL[inst],temp2);
         sBB_GEN[bb]=temp2;
+//        sBB_GEN[bb].erase(sKILL[inst].begin(),sKILL[inst].end());
 
-        // if(std::find(sGEN.begin(),sGEN.end(),&inst)!=sGEN.end()){
         if(IN_SET(sGEN, inst)){
             sBB_KILL[bb].erase(inst);
         }
@@ -1849,6 +1851,7 @@ struct CAT : public ModulePass {
         /**
          * calculate GEN/KILL for each basic block
          * */
+         //timer.start();
         for(auto &bb :F){
             sBB_IN[&bb] = std::set<Value*>();
             sBB_OUT[&bb] = std::set<Value*>();
@@ -1894,53 +1897,26 @@ struct CAT : public ModulePass {
             /**
              * IN[B] = U <p pred of B> OUT[p]
              */
-            std::set<Value*> preds;
+            sBB_IN[B].clear();
             for(BasicBlock *Pred : predecessors(B)){
-                // std::set<Value*> temp3;
-                preds.insert(sBB_OUT[Pred].begin(), sBB_OUT[Pred].end());
-                // set_union(sBB_IN[B],sBB_OUT[Pred],temp3);
-                // sBB_IN[B]=temp3;
+                sBB_IN[B].insert(sBB_OUT[Pred].begin(), sBB_OUT[Pred].end());
             }
-            sBB_IN[B]=preds;
+
             
-            std::set<Value*> out;
+            //std::set<Value*> out;
             std::set<Value*> temp;
             //  TEMP = (IN[i]-KILL[i])
             set_diff(sBB_IN[B],sBB_KILL[B],temp);
             //  OUT = GEN[i] U TEMP
-            set_union(sBB_GEN[B],temp,out);
-            sBB_OUT[B] = out;
+            set_union(sBB_GEN[B],temp,sBB_OUT[B]);
+            //sBB_OUT[B] = out;
             if(oldOUT!=sBB_OUT[B]){
-                std::set<BasicBlock*> sucSet;
-                for(BasicBlock *Suc : successors(B)){
-                    sucSet.insert(Suc);
-                }
-                set_union(workList,sucSet,workList);
+                // Union
+                auto succ = successors(B);
+                workList.insert(succ.begin(),succ.end());
             }
 
         }
-//        bool changed;
-//        do{
-//            changed = false;
-//            for(BasicBlock &bb : F){
-//                for(BasicBlock *Pred : predecessors(&bb)){
-//                    std::set<Value*> temp3;
-//                    set_union(sBB_IN[&bb],sBB_OUT[Pred],temp3);
-//                    sBB_IN[&bb]=temp3;
-//                }
-//                std::set<Value*> out;
-//                std::set<Value*> temp;
-//                //  TEMP = (IN[i]-KILL[i])
-//                set_diff(sBB_IN[&bb],sBB_KILL[&bb],temp);
-//                //  OUT = GEN[i] U TEMP
-//                set_union(sBB_GEN[&bb],temp,out);
-//
-//                if(!changed){
-//                    changed = (out!=sBB_OUT[&bb]);
-//                }
-//                sBB_OUT[&bb] = out;
-//            }
-//        }while(changed);
 
     }
 
@@ -2012,17 +1988,22 @@ struct CAT : public ModulePass {
         }
 
     void __INSTR_INOUT(std::set<Value*> & prev_out, Instruction * inst) {
+        if(!IN_SET(sGEN,inst)&&sKILL[inst].empty()){
+            sIN[inst] = prev_out;
+            sOUT[inst] = prev_out;
+            return;
+        }
 
         std::set<Value*> local_INSTR_IN = prev_out;
 
         //TODO: need to be replaced by bitwise_diff function later
         std::set<Value*> local_INSTR_OUT = local_INSTR_IN;
-        if(!IN_SET(sGEN,inst)&&sKILL[inst].empty()){
-            sIN[inst] = local_INSTR_IN;
-            sOUT[inst] = local_INSTR_OUT;
-            prev_out = local_INSTR_OUT;
-            return;
-        }
+//        if(!IN_SET(sGEN,inst)&&sKILL[inst].empty()){
+//            sIN[inst] = local_INSTR_IN;
+//            sOUT[inst] = local_INSTR_OUT;
+//            prev_out = local_INSTR_OUT;
+//            return;
+//        }
 
         /**
          * IN[i] - KILL[i]
@@ -2046,10 +2027,7 @@ struct CAT : public ModulePass {
     void sIN_OUT_inst(Function &F){
         for (BasicBlock &bb : F){
             std::set<Value*> prev_out = sBB_IN[&bb];
-            // errs() << "Basic block IN : " << bb << '\n';
-            // print_set_with_addr(prev_out);
-//            if(sBB_GEN[&bb].empty()&&sBB_KILL[&bb].empty())
-//                continue;
+
             for(auto &I : BB2CAT[&bb]){
                 if(isa<Instruction>(I)){
                     Instruction *inst = cast<Instruction>(I);
@@ -4128,8 +4106,8 @@ struct CAT : public ModulePass {
         live_analysis_GENKILL(F, AA);
             timer.stop();
             timer.printDuration("\t\tLIVE GEN-KILL ");
-        
-            timer.start();  
+
+            timer.start();
         backward_INOUT(
             F,
             live_GEN,
