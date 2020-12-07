@@ -119,6 +119,11 @@ struct CAT : public FunctionPass {
 
     std::map<Value * , Value *> auto2def;
 
+    std::map<Value *, std::set<Value *>> live_GEN, live_KILL, live_might_KILL;
+    std::map<Value *, std::set<Value *>> live_IN, live_OUT;
+    
+    std::unordered_map<Value *,std::vector<Instruction*>> liveBB2CAT;
+
 #define IS_PTR_TYPE(val) (isa<PointerType>(val->getType()) )
 #define IS_INT_TYPE(val) (isa<IntegerType>(val->getType()) )
 #define HAS_MOD(info) (\
@@ -547,34 +552,35 @@ struct CAT : public FunctionPass {
         ptr2Val.clear();
     }
     
-    Value * auto_trace_back(Value * val) {
+    bool CAT_auto_trace_back(Value * val, Value ** real) {
         if (IN_MAP(auto2def, val)){
-            return auto2def[val];
+            *real = auto2def[val];
+            return true;
         }
 
         if (!isa<IntToPtrInst>(val)) {
-            return val;
+            return false;
         }
         
         IntToPtrInst * int2ptr = cast<IntToPtrInst>(val);
         Value * int2ptr_op0 = int2ptr->getOperand(0);    
         
         if(!isa<AShrOperator>(int2ptr_op0)){
-            return val;
+            return false;
         }
         
         AShrOperator * ashr = cast<AShrOperator>(int2ptr_op0);
         Value * ashr_op0 = ashr->getOperand(0);
         
         if(!isa<ShlOperator>(ashr_op0)){
-            return val;
+            return false;
         }
 
         ShlOperator * shl = cast<ShlOperator>(ashr_op0);
         Value * shl_op0 = shl->getOperand(0);
         
         if(!isa<PtrToIntInst>(shl_op0)){
-            return val;
+            return false;
         }
 
         PtrToIntInst * ptr2int = cast<PtrToIntInst>(shl_op0);
@@ -582,7 +588,8 @@ struct CAT : public FunctionPass {
 
         errs() << *val << " can be traced back as auto of " << *ptr2int_op0 << '\n';
         auto2def[val] = ptr2int_op0;
-        return ptr2int_op0;
+        *real = ptr2int_op0;
+        return true;
     }
 
     void select_phi_trace_back(Value * val, std::vector<Value *> & res) {
@@ -2709,16 +2716,6 @@ struct CAT : public FunctionPass {
         }
     }
 
-    /**
-     *  live_{GEN|KILL|IN|OUT} are for the liveness of values of variables
-     *  ref_{GEN|KILL|IN|OUT} are for the liveness of References of variables
-     * */
-
-    std::map<Value *, std::set<Value *>> live_GEN, live_KILL;
-    std::map<Value *, std::set<Value *>> live_IN, live_OUT;
-    std::map<Value *, std::set<Value *>> ref_GEN, ref_KILL;
-    std::map<Value *, std::set<Value *>> ref_IN, ref_OUT;
-
     void live_analysis_init() {
         // std::map<Value *, std::set<Value *>> live_GEN, live_KILL;
         // std::map<Value *, std::set<Value *>> live_IN, live_OUT;
@@ -2727,6 +2724,8 @@ struct CAT : public FunctionPass {
         live_KILL.clear();
         live_IN.clear();
         live_OUT.clear();
+
+        liveBB2CAT.clear();
     }
 
 
@@ -2756,6 +2755,21 @@ struct CAT : public FunctionPass {
         std::vector<Value *> aliases;
         might_alias(inst, used_var, aliases);
         live_GEN[inst].insert(aliases.begin(), aliases.end());
+
+        // errs() << "At " << *inst  << *used_var << " might alias "  << '\n';
+        // for (Value * might_a: aliases) {
+        //     errs() << *might_a << '\n';
+        // }
+
+        Value * auto_res;
+        bool is_auto = CAT_auto_trace_back(used_var, &auto_res);
+        if (is_auto) {
+            /**
+             *  If auto, apply the same thing on the traced back variable.
+             * */
+            live_GEN_populate(inst, auto_res);
+        }
+
     }
 
     void live_KILL_populate(Instruction * inst, Value * def_var) {
@@ -2770,6 +2784,19 @@ struct CAT : public FunctionPass {
                 live_KILL[inst].insert(must_val);
             }
         }
+
+        std::vector<Value *> aliases;
+        might_alias(inst, def_var, aliases);
+        live_might_KILL[inst].insert(aliases.begin(), aliases.end());
+
+        Value * auto_res;
+        bool is_auto = CAT_auto_trace_back(def_var, &auto_res);
+        if (is_auto) {
+            /**
+             *  If auto, apply the same thing on the traced back variable.
+             * */
+            live_KILL_populate(inst, auto_res);
+        }
     }
 
     void live_analysis_GENKILL(Function & F, AliasAnalysis & AA ){
@@ -2781,12 +2808,15 @@ struct CAT : public FunctionPass {
                 if(fptr){
                     CallInst * call_instr = cast<CallInst>(&inst);
                     if (IS_CAT_OP(fptr)){
+                        liveBB2CAT[&bb].push_back(call_instr);
+
                         // errs() << "analyzing " << *call_instr << '\n';
                         if (IS_CAT_new(fptr)){
                             // only define but not killed
                             live_KILL[&inst].insert(&inst);
                             
-                            ref_KILL[&inst].insert(&inst);
+                            // ref_KILL[&inst].insert(&inst);
+                            
                         } else if (IS_CAT_get(fptr)) {
                             /**
                              *  Only use variable, both value and reference
@@ -2795,7 +2825,7 @@ struct CAT : public FunctionPass {
                             
                             live_GEN_populate(call_instr, arg0);
 
-                            ref_GEN[&inst].insert(arg0);
+                            // ref_GEN[&inst].insert(arg0);
                             
                         } else if (IS_CAT_set(fptr)) {
                             // CAT_set, define and usearg0
@@ -2805,7 +2835,7 @@ struct CAT : public FunctionPass {
 
                             live_KILL_populate(call_instr, arg0);
 
-                            ref_GEN[&inst].insert(arg0);
+                            // ref_GEN[&inst].insert(arg0);
                         } else {
                             // CAT_add, CAT_sub
                             // define arg0
@@ -2821,12 +2851,13 @@ struct CAT : public FunctionPass {
 
                             live_GEN_populate(call_instr, arg2);
 
-                            ref_GEN[&inst].insert(arg0);
-                            ref_GEN[&inst].insert(arg1);
-                            ref_GEN[&inst].insert(arg2);
+                            // ref_GEN[&inst].insert(arg0);
+                            // ref_GEN[&inst].insert(arg1);
+                            // ref_GEN[&inst].insert(arg2);
                         }   
 
                     } else if (IS_USER_FUNC(fptr)){
+                        liveBB2CAT[&bb].push_back(call_instr);
                         uint32_t arg_cnt = call_instr->getNumArgOperands();
                         for(uint32_t i = 0; i < arg_cnt; i++){
                             Value * arg = call_instr->getArgOperand(i);
@@ -2863,7 +2894,7 @@ struct CAT : public FunctionPass {
                                 // }
                                 live_KILL[&inst].insert(arg);
                                 live_GEN[&inst].insert(arg);
-                                ref_GEN[&inst].insert(arg);
+                                // ref_GEN[&inst].insert(arg);
                             }
                         
                         }
@@ -2875,103 +2906,43 @@ struct CAT : public FunctionPass {
                     }
 
                 } else if (isa<PHINode>(&inst)){
+
                     PHINode * phi = cast<PHINode>(&inst);
+                    
                     if (IS_PTR_TYPE(phi)) {
                         live_KILL[phi].insert(phi);
-                        ref_KILL[phi].insert(phi);
+                        // ref_KILL[phi].insert(phi);
 
                         uint32_t numIncome =  phi->getNumIncomingValues();
 
                         for (uint32_t i = 0; i < numIncome; i++) {
                             Value * in_value = phi->getIncomingValue(i);
                             live_GEN[phi].insert(in_value);
-                            ref_GEN[phi].insert(in_value);
+                            // ref_GEN[phi].insert(in_value);
                         }
+                        
+                        liveBB2CAT[&bb].push_back(phi);
                     }
 
                 } else if (isa<SelectInst>(&inst)){
                     SelectInst * select_inst = cast<SelectInst>(&inst);
                     if (IS_PTR_TYPE(select_inst)) {
                         live_KILL[select_inst].insert(select_inst);
-                        ref_KILL[select_inst].insert(select_inst);
+                        // ref_KILL[select_inst].insert(select_inst);
 
                         Value * op1 = select_inst->getOperand(1);
                         Value * op2 = select_inst->getOperand(2);
                         
                         live_GEN[select_inst].insert(op1);
-                        ref_GEN[select_inst].insert(op1);
+                        // ref_GEN[select_inst].insert(op1);
 
                         live_GEN[select_inst].insert(op2);
-                        ref_GEN[select_inst].insert(op2);
+                        // ref_GEN[select_inst].insert(op2);
+
+                        liveBB2CAT[&bb].push_back(select_inst);
                     }   
 
-                } else if (isa<StoreInst>(&inst)) {
-                    
-                    StoreInst * store_inst = cast<StoreInst>(&inst);
-                    Value * ptr = store_inst->getPointerOperand();
-                    Value * val = store_inst->getValueOperand();
-                    
-                    live_KILL[store_inst].insert(ptr);
-                    ref_GEN[store_inst].insert(val);
-                    live_GEN[store_inst].insert(val);
-
-                } else if (isa<LoadInst>(&inst)) {
-                    LoadInst * load_inst = cast<LoadInst>(&inst);
-                    Value * ptr = load_inst->getPointerOperand();
-                    
-                    live_GEN[load_inst].insert(ptr);
-                    ref_KILL[load_inst].insert(load_inst);
-                    live_KILL[load_inst].insert(load_inst);
-                
-                } else if (isa<AllocaInst>(&inst)) {
-                    AllocaInst * alloc_inst = cast<AllocaInst>(&inst);
-                    
-                    ref_KILL[alloc_inst].insert(alloc_inst);
-
-                } else if (isa<ReturnInst>(&inst)) {
-
-                    
-                    ReturnInst * return_inst = cast<ReturnInst>(&inst);
-                    Value * ret_val = return_inst->getReturnValue();
-
-                    if (ret_val && IS_PTR_TYPE(ret_val)){
-                        ref_GEN[return_inst].insert(ret_val);
-                        live_GEN[return_inst].insert(ret_val);
-                    }
-
-                } else if (isa<PtrToIntInst>(&inst)) {
-                    PtrToIntInst * ptr2int = cast<PtrToIntInst>(&inst);
-                    Value * ptr2int_op0 = ptr2int->getOperand(0);
-
-                    ref_GEN[ptr2int].insert(ptr2int_op0);
-                    ref_KILL[ptr2int].insert(ptr2int);
-                    live_KILL[ptr2int].insert(ptr2int);
-
-                } else if (isa<ShlOperator>(&inst)) {
-                    ShlOperator * shl = cast<ShlOperator>(&inst);
-                    Value * shl_op0 = shl->getOperand(0);
-
-                    ref_GEN[shl].insert(shl_op0);
-                    ref_KILL[shl].insert(shl);
-                    live_KILL[shl].insert(shl);
-
-                } else if (isa<AShrOperator>(&inst)) {
-                    AShrOperator * ashr = cast<AShrOperator>(&inst);
-                    Value * ashr_op0 = ashr->getOperand(0);
-
-                    ref_GEN[ashr].insert(ashr_op0);
-                    ref_KILL[ashr].insert(ashr);
-                    live_KILL[ashr].insert(ashr);
-
-                } else if (isa<IntToPtrInst>(&inst)) {
-                    IntToPtrInst * int2ptr = cast<IntToPtrInst>(&inst);
-                    Value * int2ptr_op0 = int2ptr->getOperand(0);
-
-                    ref_GEN[int2ptr].insert(int2ptr_op0);
-                    ref_KILL[int2ptr].insert(int2ptr);
-                    live_KILL[int2ptr].insert(int2ptr);
-
-                }
+                } 
             }
         }
 
@@ -2979,6 +2950,7 @@ struct CAT : public FunctionPass {
         // errs() << "printing reference variables\n";
         // print_set_reference(referenced_var);
     }
+
 
     bool calc_live_OUT2IN(
         Instruction * inst,
@@ -3018,22 +2990,41 @@ struct CAT : public FunctionPass {
         std::map<Value *, std::set<Value *>> & OUT
     ) {
         std::set<BasicBlock *> bb_calced;
-
+        std::queue<BasicBlock *> workList;
         bool changed;
         do {
             changed = false;
-            for (BasicBlock & bb : F) {
-                Instruction * last_inst = bb.getTerminator(); 
+            auto bblist = &F.getBasicBlockList();
+            // for (BasicBlock & bb : F) {
+            for (auto bb_it = bblist->rbegin(); bb_it != bblist->rend(); bb_it++ ){
+                // Instruction * last_inst = bb.getTerminator(); 
+                // errs() << "Analyzing " << bb ;
+                BasicBlock * bb = &*bb_it;
+
+                Instruction * last_inst;
+                if (liveBB2CAT[bb].empty()){
+                    last_inst = bb->getTerminator();
+                } else {
+                    last_inst = liveBB2CAT[bb].back();
+                }
+                
                 
                 /**
                  *  Calculate OUT of last instruction from IN of successors
                  * */
-                for (BasicBlock * succBB : successors(&bb)) {
-                    Instruction * predBB_terminator = &succBB->front();
+                for (BasicBlock * succBB : successors(bb)) {
+
+                    Instruction * predBB_beginner; 
+
+                     if (liveBB2CAT[succBB].empty()){
+                        predBB_beginner = &*succBB->begin();
+                    } else {
+                        predBB_beginner = liveBB2CAT[succBB].front();
+                    }
 
                     OUT[last_inst].insert(
-                        IN[predBB_terminator].begin(),
-                        IN[predBB_terminator].end()
+                        IN[predBB_beginner].begin(),
+                        IN[predBB_beginner].end()
                     );
                 }
 
@@ -3041,25 +3032,31 @@ struct CAT : public FunctionPass {
                 
                 if (!changed) changed = last_in_changed;
 
-                if (last_in_changed  || !IN_SET(bb_calced, &bb)) {
+                if (last_in_changed  || !IN_SET(bb_calced, bb)) {
                     bool in_changed;
                     std::set<Value *> nextIN = IN[last_inst];
 
-                    for (auto iter = (++bb.rbegin()); iter != bb.rend(); iter++) {
-                        Instruction * cur_ptr = &*iter;
-                        OUT[cur_ptr] = nextIN;
+                    if (liveBB2CAT[bb].empty()){
+                        Instruction * beginner = &*bb->begin();
+                        OUT[beginner] = nextIN;
 
-                        in_changed = calc_live_OUT2IN(cur_ptr, GEN, KILL, IN, OUT);
+                        calc_live_OUT2IN(beginner, GEN, KILL, IN, OUT);
+                    }else {
+                        for (auto iter = (++liveBB2CAT[bb].rbegin()); iter != liveBB2CAT[bb].rend(); iter++) {
+                            Instruction * cur_ptr = *iter;
+                            OUT[cur_ptr] = nextIN;
 
-                        nextIN = IN[cur_ptr];
+                            in_changed = calc_live_OUT2IN(cur_ptr, GEN, KILL, IN, OUT);
+
+                            nextIN = IN[cur_ptr];
+                        }
                     }
 
                     if (!changed) changed = in_changed;
-                    bb_calced.insert(&bb);
+                    
+                    bb_calced.insert(bb);
                 } 
-
             }
-
         } while(changed);
     }
 
@@ -3096,7 +3093,8 @@ struct CAT : public FunctionPass {
         if (!IS_CAT_OP(fptr)) return false;
 
         if (IS_CAT_new(fptr)) {
-            return !IN_SET(ref_OUT[inst], inst);           
+            return inst->user_empty();
+            // return !IN_SET(ref_OUT[inst], inst);           
         }
 
         bool escaped = var_escaped(inst, inst->getArgOperand(0));
@@ -3107,10 +3105,12 @@ struct CAT : public FunctionPass {
          *  An instruction can be eliminated if what it defines will not be used by later instructions
          *  live_OUT[inst] & live_KILL[inst] = empty
          * */
+
         std::set<Value *> laterUsed;
         set_intersect(
             live_OUT[inst],     /* srcA */
-            live_KILL[inst],    /* srcB */
+            // live_KILL[inst],    /* srcB */
+            live_might_KILL[inst],    /* srcB */
             laterUsed           /* target */
         );
 
@@ -3138,7 +3138,7 @@ struct CAT : public FunctionPass {
                         bool canElim = can_be_eliminated(call_inst);
                         if (canElim){
                             to_eliminate.push_back(call_inst);
-                            errs() << "Eliminating " << *call_inst << '\n';
+                            // errs() << "Eliminating " << *call_inst << '\n';
                         }
                     }
                 }
@@ -3200,31 +3200,10 @@ struct CAT : public FunctionPass {
 
     }
 
-    void print_ref_INOUT(Function &F){
-        errs() << "Function \"" << F.getName() << "\" " << '\n';
-        for (BasicBlock &bb : F){
-            for(Instruction &inst : bb){
-                errs() << "INSTRUCTION: " << inst << '\n';
-                errs() << "***************** ref IN\n{\n";
-                print_set_with_addr(ref_IN[&inst]);
-                
-                errs() << "}\n";
-                errs() << "**************************************\n";
-                errs() << "***************** ref OUT\n{\n";
-
-
-                print_set_with_addr(ref_OUT[&inst]);
-                errs() << "}\n";
-                errs() << "**************************************\n";
-                errs() << "\n\n\n";
-            }
-        }
-
-    }
-
     void live_analysis_wrapper(Function &F, AliasAnalysis & AA){
-        errs() << "liveness Analysis on " << F.getName() << '\n';
+        // errs() << "liveness Analysis on " << F.getName() << '\n';
         live_analysis_init();
+        
         live_analysis_GENKILL(F, AA);
 
         backward_INOUT(
@@ -3234,20 +3213,19 @@ struct CAT : public FunctionPass {
             live_IN,
             live_OUT
         );
-
-        backward_INOUT(
-            F,
-            ref_GEN,
-            ref_KILL,
-            ref_IN,
-            ref_OUT
-        );
+        // backward_INOUT(
+        //     F,
+        //     ref_GEN,
+        //     ref_KILL,
+        //     ref_IN,
+        //     ref_OUT
+        // );
         // print_live_GENKILL(F);
         // print_live_INOUT(F);
         
         // print_ref_INOUT(F);
 
-        errs() << "Done: liveness Analysis on " << F.getName() << '\n';
+        // errs() << "Done: liveness Analysis on " << F.getName() << '\n';
     }
     
     // eliminating(F, AA);
